@@ -52,8 +52,15 @@ done
 
 # ============================================================
 # 提取 DSH 访问 token，输出对外访问地址提示
+# （dsh web 的 token 行存在 stdout 缓冲，curl 就绪时未必已 flush，
+#  因此轮询读取日志直到出现 token）
 # ============================================================
-TOKEN=$(grep -oE 'token=[A-Za-z0-9_-]+' /tmp/dsh.log | head -1 | cut -d= -f2)
+TOKEN=""
+for i in $(seq 1 15); do
+    TOKEN=$(grep -oE 'token=[A-Za-z0-9_-]+' /tmp/dsh.log | head -1 | cut -d= -f2)
+    [ -n "$TOKEN" ] && break
+    sleep 1
+done
 if [ -n "$TOKEN" ]; then
     echo "------------------------------------------------------------"
     echo "请访问: https://<Your-IP-Address>/?token=${TOKEN}"
