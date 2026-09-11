@@ -38,9 +38,9 @@ RUN curl -fsSL https://nginx.org/keys/nginx_signing.key \
     rm -rf /var/lib/apt/lists/*
 
 # ============================================================
-# 第四阶段：安装 DSH
+# 第四阶段：安装 DSH + pnpm（DSH 用 pnpm 管理插件）
 # ============================================================
-RUN npm install -g @deepseek-ai/dsh
+RUN npm install -g @deepseek-ai/dsh pnpm
 
 # ============================================================
 # 第五阶段：配置 Nginx 反向代理 + 启动脚本
