@@ -57,9 +57,10 @@ RUN npm config set registry https://registry.npmmirror.com \
 RUN npm install -g @deepseek-ai/dsh
 
 # ============================================================
-# 插件层：dsh-web-lan-access（依赖 dsh + pnpm，放最后，变更时只重建这层）
+# 插件层：dsh-web-lan-access + dsh-ctl（依赖 dsh + pnpm，放最后，变更时只重建这层）
 # ============================================================
-RUN dsh plugin --profile web add dsh-web-lan-access
+RUN dsh plugin --profile web add dsh-web-lan-access \
+    && dsh plugin --profile web add dsh-ctl
 
 # ============================================================
 # 运行时配置（配置文件复制层，改配置只重建这层及之后）

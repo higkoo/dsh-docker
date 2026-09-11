@@ -17,15 +17,17 @@ if [ ! -f /etc/nginx/ssl/dsh.crt ]; then
 fi
 
 # ============================================================
-# 确保 dsh-web-lan-access 插件就位
+# 确保 dsh-web-lan-access、dsh-ctl 插件就位
 # （镜像构建时已预装；去 VOLUME 后构建层直接保留，这里仅作兜底）
 # ============================================================
 if [ ! -d /root/.dsh/profiles/web ]; then
     echo "补装插件（profile 缺失）..."
     dsh plugin --profile web add dsh-web-lan-access \
         || echo "dsh-web-lan-access 安装失败，继续启动..."
+    dsh plugin --profile web add dsh-ctl \
+        || echo "dsh-ctl 安装失败，继续启动..."
 else
-    echo "dsh 插件已就位（dsh-web-lan-access）"
+    echo "dsh 插件已就位（dsh-web-lan-access、dsh-ctl）"
 fi
 
 # ============================================================
