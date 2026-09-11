@@ -12,7 +12,7 @@ if [ ! -f /etc/nginx/ssl/dsh.crt ]; then
         -out /etc/nginx/ssl/dsh.crt \
         -days 3650 \
         -subj "/C=CN/ST=Shanghai/L=Shanghai/O=Marivo/OU=DevOps/CN=higkoo" \
-        -addext "subjectAltName=IP:0.0.0.0/0,DNS:*"
+        -addext "subjectAltName=IP:0.0.0.0,DNS:*"
     echo "自签证书已生成"
 fi
 
