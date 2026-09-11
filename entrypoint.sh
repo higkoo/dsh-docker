@@ -17,17 +17,24 @@ if [ ! -f /etc/nginx/ssl/dsh.crt ]; then
 fi
 
 # ============================================================
-# 安装 dsh-lan-bridge 插件（DSH 原生双重安全限制：仅 localhost 可访问
-# 特权方法。该插件让局域网也能使用 settings/credentials/llm 等页面）
+# 确保 dsh-lan-bridge 插件就位
+# （镜像构建时已预装到 /root/.dsh；但该路径是 VOLUME，若运行时挂了
+# 空卷会覆盖构建层，此时补装一次。已有则跳过，不每次安装）
 # ============================================================
-echo "安装 dsh-lan-bridge 插件..."
-dsh plugin --profile web add dsh-lan-bridge || echo "dsh-lan-bridge 已安装或安装失败，继续..."
+if [ ! -d /root/.dsh/profiles/web ]; then
+    echo "补装 dsh-lan-bridge 插件（profile 缺失）..."
+    dsh plugin --profile web add dsh-lan-bridge \
+        || echo "dsh-lan-bridge 安装失败，继续启动..."
+else
+    echo "dsh-lan-bridge 插件已就位"
+fi
 
 # ============================================================
-# 启动 DSH Web UI
+# 启动 DSH Web UI（后台，日志重定向到文件以便抓取 token）
 # ============================================================
 echo "启动 DSH Web UI..."
-dsh web --no-open &
+: > /tmp/dsh.log
+dsh web --no-open > /tmp/dsh.log 2>&1 &
 
 echo "等待 DSH 就绪..."
 for i in $(seq 1 60); do
@@ -37,13 +44,30 @@ for i in $(seq 1 60); do
     fi
     if [ "$i" -eq 60 ]; then
         echo "DSH 启动超时，请检查日志"
+        cat /tmp/dsh.log
         exit 1
     fi
     sleep 1
 done
 
 # ============================================================
-# 启动 Nginx，终端输出 access 日志
+# 提取 DSH 访问 token，输出对外访问地址提示
 # ============================================================
-echo "启动 Nginx 反向代理 (HTTPS)..."
-exec nginx -g 'daemon off;'
+TOKEN=$(grep -oE 'token=[A-Za-z0-9_-]+' /tmp/dsh.log | head -1 | cut -d= -f2)
+if [ -n "$TOKEN" ]; then
+    echo "------------------------------------------------------------"
+    echo "请访问: https://<Your-IP-Address>/?token=${TOKEN}"
+    echo "------------------------------------------------------------"
+else
+    echo "未抓到 token，请查看 /tmp/dsh.log"
+fi
+
+# ============================================================
+# 后台启动 Nginx，前台 tail access.log + error.log
+# ============================================================
+echo "启动 Nginx 反向代理 (HTTPS, 后台)..."
+nginx
+sleep 1
+
+echo "Nginx 已启动，开始跟踪日志..."
+tail -f /var/log/nginx/access.log /var/log/nginx/error.log

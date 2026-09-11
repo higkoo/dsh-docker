@@ -38,9 +38,11 @@ RUN curl -fsSL https://nginx.org/keys/nginx_signing.key \
     rm -rf /var/lib/apt/lists/*
 
 # ============================================================
-# 第四阶段：安装 DSH + pnpm（DSH 用 pnpm 管理插件）
+# 第四阶段：安装 DSH + pnpm，并预装 dsh-lan-bridge 插件
+# （DSH 用 pnpm 管理插件；预装后镜像自带，避免每次启动都联网安装）
 # ============================================================
-RUN npm install -g @deepseek-ai/dsh pnpm
+RUN npm install -g @deepseek-ai/dsh pnpm \
+    && dsh plugin --profile web add dsh-lan-bridge
 
 # ============================================================
 # 第五阶段：配置 Nginx 反向代理 + 启动脚本
