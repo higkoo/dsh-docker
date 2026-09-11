@@ -60,10 +60,15 @@ sleep 1
 echo "Nginx 已启动"
 
 # ============================================================
-# 执行 /dshctl restart now（确保插件生效后重启一次）
+# 通过 HTTP API 重启 DSH（确保插件生效后重启一次）
+# /dshctl 是进入 dsh 后的做法，容器里用 curl 调用 DSH 的 HTTP 接口
 # ============================================================
-echo "执行 /dshctl restart now ..."
-/dshctl restart now || echo "/dshctl 执行失败或不存在，继续..."
+echo "触发 DSH 重启 (curl POST /dshctl/restart)..."
+curl -s -X POST http://127.0.0.1:3080/dshctl/restart \
+    || echo "重启请求失败，继续..."
+
+echo "查看重启状态 (curl /dshctl/status)..."
+curl -s http://127.0.0.1:3080/dshctl/status || echo "(无状态响应)"
 
 # restart 后等待 DSH 重新就绪并重新抓取 token
 echo "等待 DSH 重新就绪..."
