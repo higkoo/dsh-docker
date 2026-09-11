@@ -3,6 +3,13 @@ FROM debian:trixie-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ============================================================
+# 切换 apt 源到阿里云镜像（加速国内构建）
+# ============================================================
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+    || sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null \
+    || true
+
+# ============================================================
 # 基础依赖层（极少变动，缓存命中率高）
 # ============================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,8 +46,10 @@ RUN mkdir -p /etc/apt/keyrings && \
 
 # ============================================================
 # pnpm 层（DSH 插件管理器，独立一层便于缓存）
+# 配置 npm 阿里云镜像加速国内构建
 # ============================================================
-RUN npm install -g pnpm
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install -g pnpm
 
 # ============================================================
 # DSH 层（升级较频繁，独立一层，前面层走缓存）
