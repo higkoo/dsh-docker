@@ -17,6 +17,13 @@ if [ ! -f /etc/nginx/ssl/dsh.crt ]; then
 fi
 
 # ============================================================
+# 安装 dsh-lan-bridge 插件（DSH 原生双重安全限制：仅 localhost 可访问
+# 特权方法。该插件让局域网也能使用 settings/credentials/llm 等页面）
+# ============================================================
+echo "安装 dsh-lan-bridge 插件..."
+dsh plugin --profile web add dsh-lan-bridge || echo "dsh-lan-bridge 已安装或安装失败，继续..."
+
+# ============================================================
 # 启动 DSH Web UI
 # ============================================================
 echo "启动 DSH Web UI..."
