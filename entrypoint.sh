@@ -17,16 +17,17 @@ if [ ! -f /etc/nginx/ssl/dsh.crt ]; then
 fi
 
 # ============================================================
-# 确保 dsh-lan-bridge 插件就位
-# （镜像构建时已预装到 /root/.dsh；但该路径是 VOLUME，若运行时挂了
-# 空卷会覆盖构建层，此时补装一次。已有则跳过，不每次安装）
+# 确保 dsh-lan-bridge、dsh-ctl 插件就位
+# （镜像构建时已预装；去 VOLUME 后构建层直接保留，这里仅作兜底）
 # ============================================================
 if [ ! -d /root/.dsh/profiles/web ]; then
-    echo "补装 dsh-lan-bridge 插件（profile 缺失）..."
+    echo "补装插件（profile 缺失）..."
     dsh plugin --profile web add dsh-lan-bridge \
         || echo "dsh-lan-bridge 安装失败，继续启动..."
+    dsh plugin --profile web add dsh-ctl \
+        || echo "dsh-ctl 安装失败，继续启动..."
 else
-    echo "dsh-lan-bridge 插件已就位"
+    echo "dsh 插件已就位（dsh-lan-bridge、dsh-ctl）"
 fi
 
 # ============================================================
@@ -51,9 +52,37 @@ for i in $(seq 1 60); do
 done
 
 # ============================================================
-# 提取 DSH 访问 token，输出对外访问地址提示
-# （dsh web 的 token 行存在 stdout 缓冲，curl 就绪时未必已 flush，
-#  因此轮询读取日志直到出现 token）
+# 后台启动 Nginx 反向代理
+# ============================================================
+echo "启动 Nginx 反向代理 (HTTPS, 后台)..."
+nginx
+sleep 1
+echo "Nginx 已启动"
+
+# ============================================================
+# 执行 /dshctl restart now（确保插件生效后重启一次）
+# ============================================================
+echo "执行 /dshctl restart now ..."
+/dshctl restart now || echo "/dshctl 执行失败或不存在，继续..."
+
+# restart 后等待 DSH 重新就绪并重新抓取 token
+echo "等待 DSH 重新就绪..."
+: > /tmp/dsh.log
+for i in $(seq 1 60); do
+    if curl -s http://127.0.0.1:3080 > /dev/null 2>&1; then
+        echo "DSH 已重新就绪 (等待 ${i}s)"
+        break
+    fi
+    if [ "$i" -eq 60 ]; then
+        echo "DSH 重新就绪超时，请检查日志"
+        cat /tmp/dsh.log
+        exit 1
+    fi
+    sleep 1
+done
+
+# ============================================================
+# 轮询提取 DSH 访问 token（restart 后 token 可能变化）
 # ============================================================
 TOKEN=""
 for i in $(seq 1 15); do
@@ -70,11 +99,7 @@ else
 fi
 
 # ============================================================
-# 后台启动 Nginx，前台 tail access.log + error.log
+# 前台跟踪 Nginx access.log + error.log
 # ============================================================
-echo "启动 Nginx 反向代理 (HTTPS, 后台)..."
-nginx
-sleep 1
-
-echo "Nginx 已启动，开始跟踪日志..."
+echo "开始跟踪日志..."
 tail -f /var/log/nginx/access.log /var/log/nginx/error.log
