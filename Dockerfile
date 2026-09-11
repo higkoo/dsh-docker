@@ -48,9 +48,10 @@ RUN npm install -g pnpm
 RUN npm install -g @deepseek-ai/dsh
 
 # ============================================================
-# dsh-lan-bridge 插件层（依赖 dsh + pnpm，放最后，变更时只重建这层）
+# 插件层：dsh-lan-bridge + dsh-ctl（依赖 dsh + pnpm，放最后，变更时只重建这层）
 # ============================================================
-RUN dsh plugin --profile web add dsh-lan-bridge
+RUN dsh plugin --profile web add dsh-lan-bridge \
+    && dsh plugin --profile web add dsh-ctl
 
 # ============================================================
 # 运行时配置（配置文件复制层，改配置只重建这层及之后）
@@ -63,7 +64,7 @@ RUN chmod +x /entrypoint.sh
 
 RUN mkdir -p /workspace /etc/nginx/ssl
 
-VOLUME ["/workspace", "/root/.dsh"]
+ENV HOSTNAME=dsh-agent
 
 EXPOSE 80 443
 
