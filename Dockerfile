@@ -3,7 +3,7 @@ FROM debian:trixie-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ============================================================
-# 第一阶段：安装基础依赖 + Python 3.12+ + OpenSSL
+# 基础依赖层（极少变动，缓存命中率高）
 # ============================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -17,7 +17,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ============================================================
-# 第二阶段：安装 Node.js 24（DSH 运行依赖，来自 NodeSource）
+# Nginx 层（官方仓库，变动频率低）
+# ============================================================
+RUN curl -fsSL https://nginx.org/keys/nginx_signing.key \
+        | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/debian trixie nginx" \
+        > /etc/apt/sources.list.d/nginx.list && \
+    apt-get update && apt-get install -y --no-install-recommends nginx && \
+    rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# Node.js 层（NodeSource，随 DSH 升级偶尔变动）
 # ============================================================
 RUN mkdir -p /etc/apt/keyrings && \
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
@@ -28,24 +38,22 @@ RUN mkdir -p /etc/apt/keyrings && \
     rm -rf /var/lib/apt/lists/*
 
 # ============================================================
-# 第三阶段：安装 Nginx 最新稳定版（来自 Nginx 官方仓库）
+# pnpm 层（DSH 插件管理器，独立一层便于缓存）
 # ============================================================
-RUN curl -fsSL https://nginx.org/keys/nginx_signing.key \
-        | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/debian trixie nginx" \
-        > /etc/apt/sources.list.d/nginx.list && \
-    apt-get update && apt-get install -y --no-install-recommends nginx && \
-    rm -rf /var/lib/apt/lists/*
+RUN npm install -g pnpm
 
 # ============================================================
-# 第四阶段：安装 DSH + pnpm，并预装 dsh-lan-bridge 插件
-# （DSH 用 pnpm 管理插件；预装后镜像自带，避免每次启动都联网安装）
+# DSH 层（升级较频繁，独立一层，前面层走缓存）
 # ============================================================
-RUN npm install -g @deepseek-ai/dsh pnpm \
-    && dsh plugin --profile web add dsh-lan-bridge
+RUN npm install -g @deepseek-ai/dsh
 
 # ============================================================
-# 第五阶段：配置 Nginx 反向代理 + 启动脚本
+# dsh-lan-bridge 插件层（依赖 dsh + pnpm，放最后，变更时只重建这层）
+# ============================================================
+RUN dsh plugin --profile web add dsh-lan-bridge
+
+# ============================================================
+# 运行时配置（配置文件复制层，改配置只重建这层及之后）
 # ============================================================
 RUN rm -f /etc/nginx/conf.d/default.conf
 COPY nginx.conf /etc/nginx/conf.d/dsh.conf
@@ -53,9 +61,6 @@ COPY nginx.conf /etc/nginx/conf.d/dsh.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# ============================================================
-# 运行时配置
-# ============================================================
 RUN mkdir -p /workspace /etc/nginx/ssl
 
 VOLUME ["/workspace", "/root/.dsh"]
