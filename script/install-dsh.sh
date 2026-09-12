@@ -3,15 +3,17 @@ set -e
 
 # ============================================================
 # DSH 及插件安装脚本
-# 读取 /DSH/config/dsh/versions.yml，按配置安装 DSH 和插件
+# 读取 /dsh/config/dsh/versions.yml，按配置安装 DSH 和插件
 # 支持两种安装方式：
 #   1. 组件名 + 版本号（npm install -g 包名@版本）
 #   2. 直接指定下载 URL（npm install -g URL）
 # ============================================================
 
-VERSIONS_FILE="${DSH_HOME:-/DSH}/config/dsh/versions.yml"
-LOG_DIR="${DSH_HOME:-/DSH}/logs/dsh"
-PLUGIN_LOG_DIR="${DSH_HOME:-/DSH}/logs/plugins"
+DSH_ROOT="${DSH_ROOT:-/dsh}"
+
+VERSIONS_FILE="${DSH_ROOT}/config/dsh/versions.yml"
+LOG_DIR="${DSH_ROOT}/log/dsh"
+PLUGIN_LOG_DIR="${DSH_ROOT}/log/plugins"
 
 mkdir -p "$LOG_DIR" "$PLUGIN_LOG_DIR"
 
@@ -110,7 +112,7 @@ install_dsh() {
     fi
 
     # 创建 dsh 软链接
-    ln -sf /DSH/apps/nodejs/bin/dsh /usr/local/bin/dsh 2>/dev/null || true
+    ln -sf "${DSH_ROOT}/apps/nodejs/bin/dsh" /usr/local/bin/dsh 2>/dev/null || true
 
     echo "  DSH 安装完成: $(dsh --version 2>&1 || echo 'unknown')"
 }
