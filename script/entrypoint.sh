@@ -13,16 +13,19 @@ set -e
 #   7. 前台跟踪日志
 # ============================================================
 
-export DSH_HOME="${DSH_HOME:-/DSH}"
-export PATH="/DSH/apps/nodejs/bin:/DSH/apps/python/bin:/DSH/apps/python/venv/bin:${PATH}"
+# DSH_ROOT: 绿色安装根目录（apps, config, log, script 等）
+export DSH_ROOT="${DSH_ROOT:-/dsh}"
+# DSH_HOME: DSH 的数据目录（profile、插件等）
+export DSH_HOME="${DSH_HOME:-/dsh/home}"
+export PATH="${DSH_ROOT}/apps/nodejs/bin:${DSH_ROOT}/apps/python/bin:${DSH_ROOT}/apps/python/venv/bin:${PATH}"
 
-DSH_LOG_DIR="${DSH_HOME}/logs/dsh"
-NGINX_LOG_DIR="${DSH_HOME}/logs/nginx"
-RUN_DIR="${DSH_HOME}/run"
-SSL_DIR="${DSH_HOME}/config/nginx/ssl"
+DSH_LOG_DIR="${DSH_ROOT}/log/dsh"
+NGINX_LOG_DIR="${DSH_ROOT}/log/nginx"
+RUN_DIR="${DSH_ROOT}/run"
+SSL_DIR="${DSH_ROOT}/config/nginx/ssl"
 DSH_LOG="${DSH_LOG_DIR}/dsh-web.log"
 
-mkdir -p "$DSH_LOG_DIR" "$NGINX_LOG_DIR" "$RUN_DIR" "$SSL_DIR"
+mkdir -p "$DSH_LOG_DIR" "$NGINX_LOG_DIR" "$RUN_DIR" "$SSL_DIR" "$DSH_HOME"
 
 # ============================================================
 # 1. 安装 DSH 及插件（如果尚未安装）
@@ -31,14 +34,14 @@ if ! command -v dsh &>/dev/null; then
     echo "============================================================"
     echo "DSH 尚未安装，执行安装脚本..."
     echo "============================================================"
-    bash "${DSH_HOME}/scripts/install-dsh.sh"
+    bash "${DSH_ROOT}/script/install-dsh.sh"
 else
     # 检查插件是否就位
-    if [ ! -d /root/.dsh/profiles/web ]; then
+    if [ ! -d "${DSH_HOME}/profiles/web" ]; then
         echo "============================================================"
         echo "DSH 插件缺失，执行安装脚本..."
         echo "============================================================"
-        bash "${DSH_HOME}/scripts/install-dsh.sh"
+        bash "${DSH_ROOT}/script/install-dsh.sh"
     else
         echo "DSH 已安装: $(dsh --version 2>&1)"
         echo "DSH 插件已就位"
@@ -90,7 +93,7 @@ done
 # 5. 启动 Nginx 反向代理（80 端口）
 # ============================================================
 echo "启动 Nginx 反向代理 (port 80)..."
-nginx -c "${DSH_HOME}/config/nginx/nginx.conf" 2>&1 &
+nginx -c "${DSH_ROOT}/config/nginx/nginx.conf" 2>&1 &
 NGINX_PID=$!
 echo "$NGINX_PID" > "${RUN_DIR}/nginx.pid"
 echo "  Nginx PID: $NGINX_PID"

@@ -1,7 +1,7 @@
 ---
 # ============================================================
 # Ansible Playbook: DSH Docker 部署
-# 读取 /DSH/config/dsh/versions.yml 版本配置
+# 读取 /dsh/config/dsh/versions.yml 版本配置
 # 自动构建镜像、启动容器、验证服务
 # ============================================================
 # 使用方式：
@@ -22,7 +22,7 @@
     # 暴露端口
     host_port: 80
     # 版本配置文件路径（容器内）
-    versions_file: "/DSH/config/dsh/versions.yml"
+    versions_file: "/dsh/config/dsh/versions.yml"
 
   tasks:
     # ------------------------------------------------------------
@@ -78,11 +78,11 @@
         ports:
           - "{{ host_port }}:80"
         volumes:
-          - "{{ project_dir }}/workspace:/DSH/workspace"
-          - "dsh-data:/root/.dsh"
-          - "{{ project_dir }}/config/dsh/versions.yml:/DSH/config/dsh/versions.yml:ro"
+          - "{{ project_dir }}/workspace:/dsh/workspace"
+          - "dsh-home:/dsh/home"
+          - "{{ project_dir }}/config/dsh/versions.yml:/dsh/config/dsh/versions.yml:ro"
         env:
-          DSH_HOME: "/DSH"
+          DSH_HOME: "/dsh/home"
         log_driver: json-file
         log_options:
           max-size: "10m"
@@ -110,6 +110,6 @@
     # ------------------------------------------------------------
     - name: Trigger DSH reinstall if URL config changed
       ansible.builtin.command: >
-        docker exec {{ container_name }} bash /DSH/scripts/install-dsh.sh
+        docker exec {{ container_name }} bash /dsh/script/install-dsh.sh
       when: dsh_url | length > 0
       ignore_errors: yes
