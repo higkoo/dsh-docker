@@ -1,4 +1,4 @@
-# DSH Docker — 绿色部署方案 v0.2.0
+# DSH Docker — 绿色部署方案 v0.1.1
 
 基于 Docker 一键部署 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 的绿色安装镜像方案。
 
