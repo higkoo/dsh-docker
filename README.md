@@ -1,87 +1,143 @@
-# DSH Docker
+# DSH Docker — 绿色部署方案
 
-基于 Docker 一键部署 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 的镜像方案。
+基于 Docker 一键部署 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 的绿色安装镜像方案。
 
-## 背景
+## 核心特性
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) 是 DeepSeek AI 开发的开源 Agent 框架，采用"一切皆插件"架构。通过 `dsh web` 启动 Web UI 后，默认绑定 `127.0.0.1:3080`，**只能本地访问**。
+- **绿色安装**：所有组件（Node.js 24、Python 3.14、Nginx）安装在 `/DSH` 目录下，不污染系统
+- **软链接**：核心二进制软链接到 `/usr/local/bin`，全局可用
+- **阿里云源**：apt 和 npm 均使用国内镜像加速
+- **版本化配置**：通过 `versions.yml` 管理 DSH 及插件版本，支持组件名+版本号和直接 URL 两种安装方式
+- **Ansible 编排**：提供 Ansible Playbook 读取版本配置并自动部署
+- **健康检查**：Nginx 提供 `/health` 状态页面
+- **日志集中**：所有日志统一存放在 `/DSH/logs/` 下，分类管理
 
-在服务器/远程部署场景下，这一限制导致无法直接对外提供服务。此外，DSH 的安全机制要求 HTTPS 访问，否则部分功能异常。
-
-## 思路
-
-| 问题 | 解决方案 |
-|---|---|
-| DSH 只绑定 localhost | Nginx 反向代理 `0.0.0.0:443` → `127.0.0.1:3080` |
-| 需要 HTTPS | 容器启动时自动生成自签证书，浏览器手动信任即可 |
-| HTTP 自动跳转 | 80 端口 `301` 跳转到 HTTPS |
-| 一键部署 | Dockerfile + entrypoint.sh 自动完成全部初始化 |
-
-**技术栈：**
-
-- **Debian 13 (trixie-slim)** — 最小化基础系统
-- **Node.js 24** (NodeSource) — DSH 运行依赖
-- **Python 3.12+** — 后续 Python 插件运行环境
-- **Nginx 最新稳定版** (官方仓库) — 反向代理 + HTTPS 终端
-
-**启动流程：**
+## /DSH 目录结构
 
 ```
-entrypoint.sh
-  ├─ 1. 生成自签证书 (首次启动)
-  ├─ 2. 后台启动 dsh web --no-open
-  ├─ 3. 等待 DSH 就绪 (健康检查 127.0.0.1:3080)
-  └─ 4. 前台启动 Nginx (daemon off, 输出 access 日志)
+/DSH/
+├── apps/                        # 应用程序安装目录（绿色安装）
+│   ├── nodejs/                  # Node.js 24（预编译二进制）
+│   │   ├── bin/                 # node, npm, npx, pnpm
+│   │   └── lib/                 # 全局 npm 包
+│   ├── python/                  # Python 3.14（源码编译）
+│   │   ├── bin/                 # python3, pip3
+│   │   ├── lib/                 # Python 标准库 + 共享库
+│   │   └── venv/                # Python 虚拟环境
+│   └── (nginx 由 apt 安装在系统路径)
+│
+├── config/                      # 配置文件目录
+│   ├── nginx/                   # Nginx 配置
+│   │   ├── nginx.conf           # Nginx 主配置
+│   │   ├── conf.d/              # 站点配置目录
+│   │   │   └── dsh-proxy.conf   # DSH 反向代理 + 健康检查
+│   │   └── ssl/                 # SSL 证书目录
+│   │       ├── dsh.crt          # 自签证书
+│   │       └── dsh.key          # 私钥
+│   ├── dsh/                     # DSH 配置
+│   │   └── versions.yml         # DSH 及插件版本配置
+│   └── ansible/                  # Ansible 部署脚本
+│       ├── playbook.yml         # 部署 Playbook
+│       └── inventory.ini        # 主机清单
+│
+├── logs/                        # 日志目录（分类管理）
+│   ├── nginx/                   # Nginx 日志
+│   │   ├── access.log           # 访问日志
+│   │   └── error.log            # 错误日志
+│   ├── dsh/                     # DSH 运行日志
+│   │   ├── dsh-web.log          # Web UI 运行日志
+│   │   └── install.log          # 安装日志
+│   └── plugins/                 # 插件日志
+│       ├── dsh-web-lan-access.log
+│       └── dsh-ctl.log
+│
+├── run/                         # 运行时目录
+│   ├── nginx.pid                # Nginx PID
+│   └── dsh.pid                  # DSH PID
+│
+├── workspace/                  # DSH 工作区
+│
+└── scripts/                    # 脚本目录
+    ├── entrypoint.sh            # 容器启动入口
+    └── install-dsh.sh          # DSH 及插件安装脚本
 ```
+
+## 技术栈
+
+| 组件 | 版本 | 安装方式 |
+|------|------|----------|
+| Debian | 13 (trixie-slim) | 基础镜像 |
+| Node.js | 24.21.0 LTS | 预编译二进制绿色安装 |
+| Python | 3.14.7 | 源码编译绿色安装 |
+| Nginx | 1.26.3 | apt 安装，配置指向 /DSH/ |
+| pnpm | 12.4.1 | npm tarball 手动绿色安装 |
+| DSH | 由 versions.yml 配置 | entrypoint.sh 动态安装 |
+
+## 版本配置 (versions.yml)
+
+支持两种安装方式，可混用：
+
+```yaml
+# 方式一：组件名 + 版本号
+dsh:
+  version: latest          # latest 或 "0.1.5-rc.1"
+
+plugins:
+  - name: dsh-web-lan-access
+    version: latest
+    profile: web
+
+# 方式二：直接指定下载 URL
+dsh:
+  url: https://registry.npmjs.com/@deepseek-ai/dsh/-/dsh-0.1.5-rc.1.tgz
+
+plugins:
+  - name: dsh-ctl
+    url: https://registry.npmjs.com/dsh-ctl/-/dsh-ctl-0.1.1.tgz
+    profile: web
+```
+
+## Nginx 配置
+
+| 路径 | 功能 |
+|------|------|
+| `/health` | Nginx stub_status 状态页面 |
+| `/` | 反向代理到 `127.0.0.1:3080`（DSH Web UI） |
+
+代理关键配置：
+- `Host: 127.0.0.1:3080` — 让 DSH 认为请求来自本地
+- `Origin: ""` — 清空 Origin 头，绕过跨站检查
+- WebSocket 支持 — 自动 Upgrade/Connection 头处理
 
 ## 使用方法
 
-### 直接拉取（推荐）
-
-```bash
-docker pull ghcr.io/higkoo/dsh:latest
-
-docker run -d \
-  --name dsh \
-  -p 80:80 -p 443:443 \
-  -v $(pwd):/workspace \
-  -v dsh-data:/root/.dsh \
-  ghcr.io/higkoo/dsh:latest
-```
-
-浏览器访问 `https://<服务器IP>`，提示证书不受信任时手动信任即可。
-
-### 本地构建
+### Docker 构建
 
 ```bash
 git clone https://github.com/higkoo/dsh-docker.git
 cd dsh-docker
 docker build -t dsh .
-docker run -d -p 80:80 -p 443:443 -v $(pwd):/workspace -v dsh-data:/root/.dsh dsh
+docker run -d -p 80:80 -v $(pwd)/workspace:/DSH/workspace -v dsh-data:/root/.dsh dsh
 ```
 
-### 参数说明
+### 从 tar 包导入
 
-| 参数 | 说明 |
-|---|---|
-| `-p 80:80` | HTTP 端口（自动跳转 HTTPS） |
-| `-p 443:443` | HTTPS 端口 |
-| `-v $(pwd):/workspace` | 挂载工作目录（DSH 的默认工作区） |
-| `-v dsh-data:/root/.dsh` | 持久化 DSH 配置数据 |
-
-### 配置模型
-
-容器启动后，打开 `https://<服务器IP>` → **Settings → Models**，填入 [DeepSeek API Key](https://platform.deepseek.com/) 即可。
-
-## 项目结构
-
+```bash
+docker load -i dsh-image.tar
+docker run -d -p 80:80 -v dsh-data:/root/.dsh localhost/dsh:latest
 ```
-├── Dockerfile                 # 镜像构建文件
-├── entrypoint.sh              # 容器启动脚本（证书生成 + DSH + Nginx）
-├── nginx.conf                 # Nginx 反向代理配置（HTTP跳转 + HTTPS）
-└── .github/workflows/
-    └── docker-build.yml       # GitHub Actions 自动构建并推送到 ghcr.io
+
+### Ansible 部署
+
+```bash
+cd ansible
+ansible-playbook -i inventory.ini playbook.yml
 ```
+
+### 访问
+
+- DSH Web UI: `http://<服务器IP>/?token=<token>`
+- 健康检查: `http://<服务器IP>/health`
 
 ## License
 
