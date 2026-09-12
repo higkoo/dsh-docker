@@ -13,6 +13,7 @@ permissions:
 
 env:
   IMAGE_NAME: dsh
+  VERSION: "0.1.0"
 
 jobs:
   build:
@@ -38,6 +39,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
+            type=raw,value=${{ env.VERSION }},enable=${{ github.ref == 'refs/heads/master' }}
             type=ref,event=branch
             type=sha,format=short
 
