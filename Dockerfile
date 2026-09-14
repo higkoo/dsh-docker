@@ -160,6 +160,18 @@ ENV DSH_HOME=/dsh/home
 ENV PATH="/dsh/app/nodejs/bin:/dsh/app/python/bin:/dsh/app/python/venv/bin:${PATH}"
 ENV HOSTNAME=dsh-web
 
+# ============================================================
+# 12. 时区设置（默认北京时间 Asia/Shanghai）
+#     - ENV TZ 让 node/python 等运行时直接读取正确时区
+#     - /etc/localtime + /etc/timezone 让 date、nginx 等系统命令
+#       与日志时间戳一并使用北京时间
+#     如需改时区：docker run -e TZ=Asia/Tokyo <image>
+# ============================================================
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo "${TZ}" > /etc/timezone \
+    && date
+
 # 端口说明：外部 9080->80(HTTP)，外部 9443->443(HTTPS/SSL)
 EXPOSE 80 443
 WORKDIR /dsh

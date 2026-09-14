@@ -26,6 +26,22 @@ export DSH_HOME="${DSH_HOME:-/dsh/home}"
 # DSH_WEB_HOST / DSH_WEB_PORT: DSH Web UI 监听地址（Nginx 反代目标）
 export DSH_WEB_HOST="${DSH_WEB_HOST:-127.0.0.1}"
 export DSH_WEB_PORT="${DSH_WEB_PORT:-3080}"
+
+# TZ: 容器时区（默认北京时间）
+# profile.env 或 docker run -e TZ=... 均可覆盖；
+# 此处同步 /etc/localtime 与 /etc/timezone，确保 date、nginx 日志等
+# 系统级时间戳与 TZ 一致（镜像构建时已固化，这里兜底处理运行时变更）。
+export TZ="${TZ:-Asia/Shanghai}"
+if [ -f "/usr/share/zoneinfo/${TZ}" ]; then
+    if [ "$(readlink -f /etc/localtime 2>/dev/null)" != "/usr/share/zoneinfo/${TZ}" ]; then
+        ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime
+        echo "${TZ}" > /etc/timezone
+        echo "  时区已切换为 ${TZ}"
+    fi
+else
+    echo "  警告: 时区 ${TZ} 在 /usr/share/zoneinfo 中不存在，沿用镜像默认时区"
+fi
+
 export PATH="${DSH_ROOT}/app/nodejs/bin:${DSH_ROOT}/app/python/bin:${DSH_ROOT}/app/python/venv/bin:${PATH}"
 
 DSH_LOG_DIR="${DSH_ROOT}/log/dsh"

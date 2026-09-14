@@ -11,6 +11,7 @@
 - **Ansible 编排**：提供 Ansible Playbook 读取版本配置并自动部署
 - **健康检查**：Nginx 提供 `/health` 状态页面，启动阶段会校验 Nginx 与 DSH 均就绪才放行
 - **进程看护**：内置 watchdog，DSH 或 Nginx 意外退出时容器会一并退出，便于 `restart_policy` 拉起
+- **时区可配**：默认北京时间（`Asia/Shanghai`），`date` 与 Nginx 日志时间戳均为东八区
 - **日志集中**：所有日志统一存放在 `/dsh/log/` 下，分类管理
 
 ## /dsh 目录结构
@@ -102,9 +103,27 @@ source /dsh/profile.env
 | `DSH_WEB_PORT` | `3080` | DSH Web UI 监听端口 |
 | `DSH_HTTP_PORT` | `9080` | 对外 HTTP 端口（仅用于启动提示，实际以 `docker run -p` 为准） |
 | `DSH_HTTPS_PORT` | `9443` | 对外 HTTPS 端口（仅用于启动提示，实际以 `docker run -p` 为准） |
+| `TZ` | `Asia/Shanghai` | 容器时区（北京时间） |
 
 > `DSH_WEB_HOST` / `DSH_WEB_PORT` 会被 `entrypoint.sh` 的就绪探测直接使用。
 > 若修改，请同步调整 `config/nginx/conf.d/dsh-proxy.conf` 中的 `proxy_pass` 目标。
+
+### 时区说明
+
+容器默认使用**北京时间（`Asia/Shanghai`）**，`date` 命令与 Nginx 日志时间戳
+（形如 `[14/Sep/2026:14:34:33 +0800]`）均为东八区时间。
+
+如需改用其他时区，两种方式：
+
+```bash
+# 方式一：临时覆盖（推荐）
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.2.1
+
+# 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
+```
+
+`entrypoint.sh` 会自动同步 `/etc/localtime` 与 `/etc/timezone`，无需手动处理；
+若指定的时区在 `zoneinfo` 中不存在，会告警并沿用镜像默认时区。
 
 ## 版本配置 (versions.yml)
 
