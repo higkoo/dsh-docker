@@ -20,68 +20,110 @@ PLUGIN_LOG_DIR="${DSH_ROOT}/log/plugins"
 mkdir -p "$LOG_DIR" "$PLUGIN_LOG_DIR"
 
 # ------------------------------------------------------------
-# 简易 YAML 解析器（不依赖 Python/Ansible，纯 bash 实现）
-# 提取 dsh.version / dsh.url 和 plugins 列表
+# 提取标量值：剥离行内注释、引号与首尾空白
+#   输入：latest        # 使用 latest 或指定版本
+#   输出：latest
+# 注意：URL 中可能含 '#'（如 git+https://host/repo#tag），
+#       因此仅当 '#' 前存在空白时才视为注释起始。
+# ------------------------------------------------------------
+extract_scalar() {
+    local raw="$1"
+
+    # 剥离行内注释：'#' 之前须为空白（或 '#' 位于行首）
+    if [[ "$raw" =~ ^[[:space:]]*# ]]; then
+        raw=""
+    elif [[ "$raw" =~ ^(.*[^[:space:]])[[:space:]]+#.*$ ]]; then
+        raw="${BASH_REMATCH[1]}"
+    fi
+
+    # 先去首尾空白，再剥引号（顺序不可颠倒：'v'  + 尾部空格需先 trim）
+    raw="$(echo "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+    # 剥离成对引号
+    raw="${raw%\"}"; raw="${raw#\"}"
+    raw="${raw%\'}"; raw="${raw#\'}"
+
+    # 剥引号后可能再次出现空白，再 trim 一次
+    raw="$(echo "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+    printf '%s' "$raw"
+}
+
+# ------------------------------------------------------------
+# 解析版本配置文件
+#   输出到全局变量：
+#     DSH_VERSION / DSH_URL   —— 仅取 dsh: 段内的字段
+#     PLUGINS                 —— 每行 "name|version|url|profile"
+#   关键：字段解析严格限定在所属缩进段内，避免 dsh 段与
+#         plugins 段的 version:/url: 互相污染。
 # ------------------------------------------------------------
 parse_versions_file() {
     local file="$1"
-    local section=""
-    local in_plugins=false
-    local current_plugin=""
 
-    # 提取 dsh 版本和 URL
-    DSH_VERSION=$(grep -E '^\s*version:' "$file" | head -1 | sed 's/.*version:\s*//' | tr -d '"' | tr -d "'")
-    DSH_URL=$(grep -E '^\s*url:' "$file" | head -1 | sed 's/.*url:\s*//' | tr -d '"' | tr -d "'")
-
-    # 如果 url 行被注释或不存在，清空
-    if echo "$DSH_URL" | grep -qE '^\s*#'; then
-        DSH_URL=""
-    fi
-
-    # 提取插件列表（逐行解析 plugins 段）
+    DSH_VERSION=""
+    DSH_URL=""
     PLUGINS=""
-    local in_plugin_section=false
-    local current_name=""
-    local current_version=""
-    local current_url=""
-    local current_profile=""
 
-    while IFS= read -r line; do
-        # 跳过注释行和空行
+    # 当前所处的顶层段：dsh / plugins / 其他
+    local section=""
+    # plugins 段内当前累积的插件字段
+    local cur_name="" cur_version="" cur_url="" cur_profile=""
+
+    # 保存当前插件到 PLUGINS
+    flush_plugin() {
+        if [ -n "$cur_name" ]; then
+            PLUGINS="${PLUGINS}${cur_name}|${cur_version}|${cur_url}|${cur_profile}"$'\n'
+        fi
+    }
+
+    # `read ... || [ -n "$line" ]` 确保最后一行无换行符时也能被处理，
+    # 同时避免 set -e 在读到 EOF 时终止脚本
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 整行注释 / 空行直接跳过（避免续读时把注释当成数据）
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "$(echo "$line" | tr -d '[:space:]')" ]] && continue
+        [[ -z "${line//[[:space:]]/}" ]] && continue
 
-        if echo "$line" | grep -qE '^plugins:'; then
-            in_plugin_section=true
+        # ---- 顶层段切换（行首无缩进且以 xxx: 结尾）----
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*$ ]]; then
+            # 离开 plugins 段时保存最后一个插件
+            if [ "$section" = "plugins" ]; then
+                flush_plugin
+                cur_name=""; cur_version=""; cur_url=""; cur_profile=""
+            fi
+            section="${BASH_REMATCH[1]}"
             continue
         fi
 
-        if [ "$in_plugin_section" = true ]; then
-            if echo "$line" | grep -qE '^\s*-\s*name:'; then
-                # 保存上一个插件
-                if [ -n "$current_name" ]; then
-                    PLUGINS="${PLUGINS}${current_name}|${current_version}|${current_url}|${current_profile}\n"
-                fi
-                current_name=$(echo "$line" | sed 's/.*name:\s*//' | tr -d '"' | tr -d "'" | tr -d '[:space:]')
-                current_version=""
-                current_url=""
-                current_profile=""
-            elif echo "$line" | grep -qE '^\s*version:'; then
-                current_version=$(echo "$line" | sed 's/.*version:\s*//' | tr -d '"' | tr -d "'" | tr -d '[:space:]')
-            elif echo "$line" | grep -qE '^\s*url:'; then
-                local url_val=$(echo "$line" | sed 's/.*url:\s*//' | tr -d '"' | tr -d "'")
-                if [ -n "$url_val" ] && ! echo "$url_val" | grep -qE '^\s*#'; then
-                    current_url="$url_val"
-                fi
-            elif echo "$line" | grep -qE '^\s*profile:'; then
-                current_profile=$(echo "$line" | sed 's/.*profile:\s*//' | tr -d '"' | tr -d "'" | tr -d '[:space:]')
+        # ---- dsh 段：只认本段内的 version / url ----
+        if [ "$section" = "dsh" ]; then
+            if [[ "$line" =~ ^[[:space:]]+version:[[:space:]]*(.*)$ ]]; then
+                DSH_VERSION="$(extract_scalar "${BASH_REMATCH[1]}")"
+            elif [[ "$line" =~ ^[[:space:]]+url:[[:space:]]*(.*)$ ]]; then
+                DSH_URL="$(extract_scalar "${BASH_REMATCH[1]}")"
             fi
+            continue
+        fi
+
+        # ---- plugins 段：按 "- name:" 切分新插件 ----
+        if [ "$section" = "plugins" ]; then
+            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]]*(.*)$ ]]; then
+                flush_plugin
+                cur_name="$(extract_scalar "${BASH_REMATCH[1]}")"
+                cur_version=""; cur_url=""; cur_profile=""
+            elif [[ "$line" =~ ^[[:space:]]+version:[[:space:]]*(.*)$ ]]; then
+                cur_version="$(extract_scalar "${BASH_REMATCH[1]}")"
+            elif [[ "$line" =~ ^[[:space:]]+url:[[:space:]]*(.*)$ ]]; then
+                cur_url="$(extract_scalar "${BASH_REMATCH[1]}")"
+            elif [[ "$line" =~ ^[[:space:]]+profile:[[:space:]]*(.*)$ ]]; then
+                cur_profile="$(extract_scalar "${BASH_REMATCH[1]}")"
+            fi
+            continue
         fi
     done < "$file"
 
-    # 保存最后一个插件
-    if [ -n "$current_name" ]; then
-        PLUGINS="${PLUGINS}${current_name}|${current_version}|${current_url}|${current_profile}"
+    # 文件结束时若仍在 plugins 段，保存最后一个插件
+    if [ "$section" = "plugins" ]; then
+        flush_plugin
     fi
 }
 
@@ -95,26 +137,43 @@ install_dsh() {
 
     local version="$DSH_VERSION"
     local url="$DSH_URL"
+    local pkg=""
+
+    # 版本号合法性校验：解析器已剥离注释，此处再做一道防线，
+    # 避免带空格/井号的脏值拼进 npm 包名导致安装静默失败
+    if [[ "$version" =~ [[:space:]#] ]]; then
+        echo "  错误：解析出的版本号含非法字符: [$version]"
+        echo "        请检查 $VERSIONS_FILE 中 dsh.version 的写法（行尾注释无需手动删除）"
+        return 1
+    fi
 
     if [ -n "$url" ]; then
         echo "  方式：URL 安装"
         echo "  URL: $url"
-        npm install -g "$url" 2>&1 | tee -a "$LOG_DIR/install.log"
+        pkg="$url"
     elif [ -n "$version" ]; then
         echo "  方式：组件名 + 版本"
         echo "  版本: $version"
         if [ "$version" = "latest" ]; then
-            npm install -g @deepseek-ai/dsh 2>&1 | tee -a "$LOG_DIR/install.log"
+            pkg="@deepseek-ai/dsh"
         else
-            npm install -g "@deepseek-ai/dsh@${version}" 2>&1 | tee -a "$LOG_DIR/install.log"
+            pkg="@deepseek-ai/dsh@${version}"
         fi
     else
         echo "  错误：versions.yml 中未配置 DSH 版本或 URL"
         return 1
     fi
 
-    # 创建 dsh 软链接
-    ln -sf "${DSH_ROOT}/app/nodejs/bin/dsh" /usr/local/bin/dsh 2>/dev/null || true
+    echo "  执行: npm install -g $pkg"
+    npm install -g "$pkg" 2>&1 | tee -a "$LOG_DIR/install.log"
+
+    # 创建 dsh 软链接（npm 全局 bin 已在 PATH 中，此处兼容非交互式 shell）
+    local dsh_bin="${DSH_ROOT}/app/nodejs/bin/dsh"
+    if [ -x "$dsh_bin" ]; then
+        ln -sf "$dsh_bin" /usr/local/bin/dsh
+    else
+        echo "  警告：未找到可执行文件 $dsh_bin"
+    fi
 
     echo "  DSH 安装完成: $(dsh --version 2>&1 || echo 'unknown')"
 }
@@ -193,9 +252,12 @@ main() {
     echo "  DSH URL: ${DSH_URL:-未指定}"
     echo "  插件列表:"
     if [ -n "$PLUGINS" ]; then
-        echo -e "$PLUGINS" | while IFS='|' read -r name version url profile; do
-            [ -n "$name" ] && echo "    - $name (version=${version:-latest}, profile=${profile:-default})"
-        done
+        # 注意：此处用 herestring 而非管道，避免 while 体在子 shell 中执行
+        # `read ... || [ -n "$name" ]` 防止 set -e 在读到 EOF 时终止脚本
+        while IFS='|' read -r name version url profile || [ -n "$name" ]; do
+            [ -n "$name" ] || continue
+            echo "    - $name (version=${version:-latest}, profile=${profile:-default})"
+        done <<< "$PLUGINS"
     else
         echo "    (无)"
     fi
@@ -212,11 +274,11 @@ main() {
         echo "============================================================"
 
         local failed=0
-        while IFS='|' read -r name version url profile; do
+        while IFS='|' read -r name version url profile || [ -n "$name" ]; do
             if [ -n "$name" ]; then
                 install_plugin "$name" "$version" "$url" "$profile" || failed=$((failed+1))
             fi
-        done <<< "$(echo -e "$PLUGINS")"
+        done <<< "$PLUGINS"
 
         if [ "$failed" -gt 0 ]; then
             echo "错误: ${failed} 个插件安装/注册失败"

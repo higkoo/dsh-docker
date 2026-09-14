@@ -19,8 +19,13 @@
     image_tag: "latest"
     # 容器名称
     container_name: "dsh-web"
-    # 暴露端口
-    host_port: 80
+    # 容器内主机名（与 entrypoint 中的 hostname 保持一致）
+    container_hostname: "dsh-web"
+    # 暴露端口（与 README / profile.env 保持一致：9080->80, 9443->443）
+    host_http_port: 9080
+    host_https_port: 9443
+    # 端口映射字符串（供 uri 健康检查使用）
+    health_url: "http://{{ inventory_hostname }}:{{ host_http_port }}/health"
     # 版本配置文件路径（容器内）
     versions_file: "/dsh/config/dsh/versions.yml"
 
@@ -72,11 +77,13 @@
     - name: Start DSH container
       community.docker.docker_container:
         name: "{{ container_name }}"
+        hostname: "{{ container_hostname }}"
         image: "{{ image_name }}:{{ image_tag }}"
         state: started
         restart_policy: unless-stopped
         ports:
-          - "{{ host_port }}:80"
+          - "{{ host_http_port }}:80"
+          - "{{ host_https_port }}:443"
         volumes:
           - "{{ project_dir }}/workspace:/dsh/workspace"
           - "dsh-home:/dsh/home"
@@ -93,7 +100,7 @@
     # ------------------------------------------------------------
     - name: Wait for DSH to be ready
       ansible.builtin.uri:
-        url: "http://{{ inventory_hostname }}:{{ host_port }}/health"
+        url: "{{ health_url }}"
         method: GET
         return_content: yes
       register: health_check

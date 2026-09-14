@@ -3,6 +3,7 @@ name: Build DSH Docker Image
 on:
   push:
     branches: [main, master, "feature/*"]
+    tags: ["v*"]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -13,10 +14,54 @@ permissions:
 
 env:
   IMAGE_NAME: dsh
-  VERSION: "v0.1.8"
+  # 版本号不再硬编码：推 tag 时用 tag 名，其余情况自动生成
+  #   v1.2.3  -> v1.2.3
+  #   分支推送 -> v0.0.0-<分支>-<短sha>（仅 latest + sha 标签）
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
 jobs:
+  # ============================================================
+  # 静态检查 + 单元测试（无需 Docker，秒级完成）
+  # ============================================================
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./script
+          additional_files: ./test/test_versions_parser.sh
+
+      - name: Bash syntax check
+        run: |
+          bash -n script/entrypoint.sh
+          bash -n script/install-dsh.sh
+
+      - name: Run versions.yml parser tests
+        run: bash test/test_versions_parser.sh
+
+      - name: Validate YAML files
+        run: |
+          python3 -c "
+          import yaml, sys
+          ok = True
+          for f in ['.github/workflows/docker-build.yml',
+                    'ansible/playbook.yml',
+                    'config/dsh/versions.yml']:
+              try:
+                  yaml.safe_load(open(f))
+                  print(f'OK   {f}')
+              except Exception as e:
+                  print(f'FAIL {f}: {e}')
+                  ok = False
+          sys.exit(0 if ok else 1)
+          "
+
   build:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,7 +84,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ env.VERSION }}
+            type=raw,value=${{ env.VERSION }},enable=${{ env.VERSION != '' }}
             type=sha,format=short
 
       - name: Build and push image
