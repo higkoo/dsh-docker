@@ -142,9 +142,9 @@ RUN rm -rf /etc/nginx/conf.d \
 # ============================================================
 ENV DSH_HOME=/dsh/home
 ENV PATH="/dsh/app/nodejs/bin:/dsh/app/python/bin:/dsh/app/python/venv/bin:${PATH}"
-ENV HOSTNAME=dsh-agent
+ENV HOSTNAME=dsh-web
 
-# 端口说明：外部 8233->80(HTTP)，外部 8443->443(HTTPS/SSL)
+# 端口说明：外部 9080->80(HTTP)，外部 9443->443(HTTPS/SSL)
 EXPOSE 80 443
 WORKDIR /dsh
 

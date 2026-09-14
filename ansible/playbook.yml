@@ -18,7 +18,7 @@
     image_name: "dsh"
     image_tag: "latest"
     # 容器名称
-    container_name: "dsh"
+    container_name: "dsh-web"
     # 暴露端口
     host_port: 80
     # 版本配置文件路径（容器内）
