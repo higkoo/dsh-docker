@@ -16,7 +16,7 @@
 
 ```
 /dsh/
-├── apps/                        # 应用程序安装目录（绿色安装）
+├── app/                         # 应用程序安装目录（绿色安装）
 │   ├── nodejs/                  # Node.js 24（预编译二进制）
 │   │   ├── bin/                 # node, npm, npx, pnpm
 │   │   └── lib/                 # 全局 npm 包

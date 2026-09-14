@@ -112,7 +112,7 @@ install_dsh() {
     fi
 
     # 创建 dsh 软链接
-    ln -sf "${DSH_ROOT}/apps/nodejs/bin/dsh" /usr/local/bin/dsh 2>/dev/null || true
+    ln -sf "${DSH_ROOT}/app/nodejs/bin/dsh" /usr/local/bin/dsh 2>/dev/null || true
 
     echo "  DSH 安装完成: $(dsh --version 2>&1 || echo 'unknown')"
 }
