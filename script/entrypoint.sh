@@ -13,10 +13,6 @@ set -e
 #   7. 前台跟踪日志
 # ============================================================
 
-# 设置容器内主机名（默认是随机容器 ID，统一为 dsh-web）
-hostname dsh-web 2>/dev/null || echo "警告: 无法设置 hostname（忽略）"
-echo "容器主机名: $(hostname 2>/dev/null)"
-
 # 加载用户环境变量（/dsh/profile.env，可手动修改后重启容器生效）
 if [ -f /dsh/profile.env ]; then
     # shellcheck source=/dev/null
