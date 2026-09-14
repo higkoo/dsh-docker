@@ -115,6 +115,7 @@ RUN echo "registry=https://registry.npmmirror.com" > /root/.npmrc \
 # ============================================================
 # 9. 复制配置文件和脚本
 # ============================================================
+COPY profile.env                       /dsh/profile.env
 COPY config/nginx/nginx.conf          /dsh/config/nginx/nginx.conf
 COPY config/nginx/conf.d/dsh-proxy.conf /dsh/config/nginx/conf.d/dsh-proxy.conf
 COPY config/dsh/versions.yml          /dsh/config/dsh/versions.yml
