@@ -1,5 +1,7 @@
 #!/bin/bash
 set -e
+# pipefail: 保证 `dsh plugin add ... | tee` 中 dsh 的真实退出码不被 tee 吞掉
+set -o pipefail
 
 # ============================================================
 # DSH 及插件安装脚本
@@ -119,6 +121,8 @@ install_dsh() {
 
 # ------------------------------------------------------------
 # 安装单个插件
+#    关键：安装命令返回成功 ≠ 注册成功，必须以 plugin list 为准；
+#    验证失败自动重试（网络抖动/注册未落盘时常见）
 # ------------------------------------------------------------
 install_plugin() {
     local name="$1"
@@ -134,20 +138,37 @@ install_plugin() {
     echo "  Profile: ${profile:-default}"
     echo "------------------------------------------------------------"
 
-    local install_cmd="dsh plugin --profile ${profile:-default} add"
-
+    # 确定安装包标识：url 优先，其次 name@version，最后 name（latest）
+    local pkg="$name"
     if [ -n "$url" ]; then
-        # URL 安装方式
-        $install_cmd "$url" 2>&1 | tee -a "$plugin_log"
+        pkg="$url"
     elif [ -n "$version" ] && [ "$version" != "latest" ]; then
-        # 指定版本安装
-        $install_cmd "${name}@${version}" 2>&1 | tee -a "$plugin_log"
-    else
-        # latest 安装
-        $install_cmd "$name" 2>&1 | tee -a "$plugin_log"
+        pkg="${name}@${version}"
     fi
 
-    echo "  插件 $name 安装完成"
+    local install_cmd="dsh plugin --profile ${profile:-default} add"
+    local registered=""
+    for attempt in 1 2 3; do
+        echo "  [${name}] 安装尝试 ${attempt}/3: $pkg"
+        if $install_cmd "$pkg" 2>&1 | tee -a "$plugin_log"; then
+            # 验证注册结果（以 plugin list 为准，而非命令退出码）
+            if dsh plugin --profile "${profile:-default}" list 2>/dev/null | grep -q "$name"; then
+                registered=1
+                break
+            fi
+            echo "  [${name}] 命令返回成功但 plugin list 未出现，重试..."
+        else
+            echo "  [${name}] 安装命令失败，重试..."
+        fi
+        sleep 2
+    done
+
+    if [ -n "$registered" ]; then
+        echo "  插件 $name 安装并注册成功"
+    else
+        echo "  错误: 插件 $name 安装/注册失败（已重试 3 次）"
+        return 1
+    fi
 }
 
 # ------------------------------------------------------------
@@ -183,18 +204,24 @@ main() {
     # 安装 DSH
     install_dsh
 
-    # 安装插件
+    # 安装插件（herestring 循环，失败计数不丢子 shell）
     if [ -n "$PLUGINS" ]; then
         echo ""
         echo "============================================================"
         echo "安装插件"
         echo "============================================================"
 
-        echo -e "$PLUGINS" | while IFS='|' read -r name version url profile; do
+        local failed=0
+        while IFS='|' read -r name version url profile; do
             if [ -n "$name" ]; then
-                install_plugin "$name" "$version" "$url" "$profile"
+                install_plugin "$name" "$version" "$url" "$profile" || failed=$((failed+1))
             fi
-        done
+        done <<< "$(echo -e "$PLUGINS")"
+
+        if [ "$failed" -gt 0 ]; then
+            echo "错误: ${failed} 个插件安装/注册失败"
+            exit 1
+        fi
     fi
 
     echo ""
