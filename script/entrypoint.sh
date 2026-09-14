@@ -13,6 +13,12 @@ set -e
 #   7. 前台跟踪日志
 # ============================================================
 
+# 加载用户环境变量（/dsh/profile.env，可手动修改后重启容器生效）
+if [ -f /dsh/profile.env ]; then
+    # shellcheck source=/dev/null
+    source /dsh/profile.env
+fi
+
 # DSH_ROOT: 绿色安装根目录（app, config, log, script 等）
 export DSH_ROOT="${DSH_ROOT:-/dsh}"
 # DSH_HOME: DSH 的数据目录（profile、插件等）
@@ -68,7 +74,8 @@ fi
 # ============================================================
 echo "启动 DSH Web UI..."
 : > "$DSH_LOG"
-dsh web --no-open > "$DSH_LOG" 2>&1 &
+# 日志同时写入 DSH_LOG（用于抓 token）并实时显示到终端
+dsh web --no-open > >(tee -a "$DSH_LOG") 2>&1 &
 DSH_PID=$!
 echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 echo "  DSH PID: $DSH_PID"
@@ -120,7 +127,8 @@ if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
 fi
 
 : > "$DSH_LOG"
-dsh web --no-open > "$DSH_LOG" 2>&1 &
+# 重启后同样实时显示到终端，并保持写盘以便抓 token
+dsh web --no-open > >(tee -a "$DSH_LOG") 2>&1 &
 DSH_PID=$!
 echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 
@@ -154,14 +162,14 @@ if [ -n "$TOKEN" ]; then
     LAN_URL=$(echo "$WEB_LINE" | grep -oE 'LAN: [^ )]+' | sed 's/LAN: //')
     echo "============================================================"
     echo "  DSH 已启动！请访问:"
-    echo "    HTTP : http://<Your-IP>:8233/?token=${TOKEN}"
-    echo "    HTTPS: https://<Your-IP>:8443/?token=${TOKEN}"
+    echo "    HTTP : http://<Your-IP>:${DSH_HTTP_PORT:-9080}/?token=${TOKEN}"
+    echo "    HTTPS: https://<Your-IP>:${DSH_HTTPS_PORT:-9443}/?token=${TOKEN}"
     if [ -n "$LAN_URL" ]; then
         echo "  LAN 访问(插件已生效): $LAN_URL"
     else
         echo "  警告: 未检测到 LAN 访问地址，dsh-web-lan-access 插件可能未加载成功"
     fi
-    echo "  健康检查页面: http://<Your-IP>:8233/health"
+    echo "  健康检查页面: http://<Your-IP>:${DSH_HTTP_PORT:-9080}/health"
     echo "============================================================"
 else
     echo "  未抓到 token，请查看日志: $DSH_LOG"

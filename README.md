@@ -26,6 +26,8 @@
 │   │   └── venv/                # Python 虚拟环境
 │   └── (nginx 由 apt 安装在系统路径)
 │
+├── profile.env                  # 环境变量配置（可手动 source 生效）
+│
 ├── config/                      # 配置文件目录
 │   ├── nginx/                   # Nginx 配置
 │   │   ├── nginx.conf           # Nginx 主配置
@@ -78,10 +80,22 @@
 
 ## 环境变量
 
+所有环境变量集中配置在 `/dsh/profile.env`，显式可见。可在容器内手动执行生效：
+
+```bash
+source /dsh/profile.env
+```
+
+修改后重启容器即自动加载，也可用 `docker run -e` 覆盖同名变量。
+
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DSH_ROOT` | `/dsh` | 绿色安装根目录 |
 | `DSH_HOME` | `/dsh/home` | DSH 数据目录（profile、插件等） |
+| `DSH_WEB_HOST` | `127.0.0.1` | DSH Web UI 监听地址（Nginx 反代目标） |
+| `DSH_WEB_PORT` | `3080` | DSH Web UI 监听端口 |
+| `DSH_HTTP_PORT` | `9080` | 对外 HTTP 端口（docker run -p 映射，仅访问提示用） |
+| `DSH_HTTPS_PORT` | `9443` | 对外 HTTPS 端口（docker run -p 映射，仅访问提示用） |
 
 ## 版本配置 (versions.yml)
 
@@ -127,14 +141,7 @@ plugins:
 git clone https://github.com/higkoo/dsh-docker.git
 cd dsh-docker
 docker build -t dsh .
-docker run -d -p 80:80 -v $(pwd)/workspace:/dsh/workspace -v dsh-home:/dsh/home dsh
-```
-
-### 从 tar 包导入
-
-```bash
-docker load -i dsh-image.tar
-docker run -d -p 80:80 -v dsh-home:/dsh/home localhost/dsh:latest
+docker run -d -p 9080:80 -p 9443:443 dsh
 ```
 
 ### Ansible 部署
