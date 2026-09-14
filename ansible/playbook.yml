@@ -1,0 +1,115 @@
+---
+# ============================================================
+# Ansible Playbook: DSH Docker 部署
+# 读取 /dsh/config/dsh/versions.yml 版本配置
+# 自动构建镜像、启动容器、验证服务
+# ============================================================
+# 使用方式：
+#   ansible-playbook -i inventory.ini playbook.yml
+# ============================================================
+
+- name: Deploy DSH Docker Container
+  hosts: dsh_servers
+  become: yes
+  vars:
+    # 项目目录（宿主机上的路径）
+    project_dir: "/workspace/dsh-docker"
+    # 镜像名称
+    image_name: "dsh"
+    image_tag: "latest"
+    # 容器名称
+    container_name: "dsh"
+    # 暴露端口
+    host_port: 80
+    # 版本配置文件路径（容器内）
+    versions_file: "/dsh/config/dsh/versions.yml"
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. 读取版本配置文件
+    # ------------------------------------------------------------
+    - name: Read versions.yml
+      ansible.builtin.slurp:
+        src: "{{ project_dir }}/config/dsh/versions.yml"
+      register: versions_content
+
+    - name: Parse DSH version
+      ansible.builtin.set_fact:
+        dsh_version: "{{ (versions_content.content | b64decode | from_yaml).dsh.version | default('latest') }}"
+        dsh_url: "{{ (versions_content.content | b64decode | from_yaml).dsh.url | default('') }}"
+        dsh_plugins: "{{ (versions_content.content | b64decode | from_yaml).plugins | default([]) }}"
+
+    - name: Display parsed configuration
+      ansible.builtin.debug:
+        msg:
+          - "DSH Version: {{ dsh_version }}"
+          - "DSH URL: {{ dsh_url | default('(not set)') }}"
+          - "Plugins: {{ dsh_plugins | map(attribute='name') | list }}"
+
+    # ------------------------------------------------------------
+    # 2. 构建 Docker 镜像
+    # ------------------------------------------------------------
+    - name: Build Docker image
+      community.docker.docker_image:
+        build:
+          path: "{{ project_dir }}"
+        name: "{{ image_name }}:{{ image_tag }}"
+        source: build
+        force_tag: yes
+
+    # ------------------------------------------------------------
+    # 3. 停止并删除旧容器（如果存在）
+    # ------------------------------------------------------------
+    - name: Stop existing container
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        state: absent
+      ignore_errors: yes
+
+    # ------------------------------------------------------------
+    # 4. 启动新容器
+    # ------------------------------------------------------------
+    - name: Start DSH container
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        image: "{{ image_name }}:{{ image_tag }}"
+        state: started
+        restart_policy: unless-stopped
+        ports:
+          - "{{ host_port }}:80"
+        volumes:
+          - "{{ project_dir }}/workspace:/dsh/workspace"
+          - "dsh-home:/dsh/home"
+          - "{{ project_dir }}/config/dsh/versions.yml:/dsh/config/dsh/versions.yml:ro"
+        env:
+          DSH_HOME: "/dsh/home"
+        log_driver: json-file
+        log_options:
+          max-size: "10m"
+          max-file: "3"
+
+    # ------------------------------------------------------------
+    # 5. 等待容器健康就绪
+    # ------------------------------------------------------------
+    - name: Wait for DSH to be ready
+      ansible.builtin.uri:
+        url: "http://{{ inventory_hostname }}:{{ host_port }}/health"
+        method: GET
+        return_content: yes
+      register: health_check
+      retries: 30
+      delay: 2
+      until: health_check.status == 200
+
+    - name: Display health check result
+      ansible.builtin.debug:
+        msg: "DSH health check passed: {{ health_check.content }}"
+
+    # ------------------------------------------------------------
+    # 6. 如果配置了 URL 安装方式，触发重新安装
+    # ------------------------------------------------------------
+    - name: Trigger DSH reinstall if URL config changed
+      ansible.builtin.command: >
+        docker exec {{ container_name }} bash /dsh/script/install-dsh.sh
+      when: dsh_url | length > 0
+      ignore_errors: yes
