@@ -6,11 +6,11 @@ set -e
 # 流程：
 #   1. 检查/安装 DSH 及插件（读取 versions.yml），并验证插件注册
 #   2. 生成自签 SSL 证书
-#   3. 启动 DSH Web UI（日志 tee 到终端 + 文件）
+#   3. 启动 DSH Web UI（日志经 FIFO 汇入 dsh-web.log + 终端）
 #   4. 启动 Nginx 反向代理（80 / 443）
 #   5. 重启 DSH 确保插件生效（以 LAN: 日志行为准，最多 3 轮）
 #   6. 输出访问地址
-#   7. 前台跟踪日志
+#   7. 前台看护（服务级健康检查，容忍 dsh-ctl 计划内重启）
 # ============================================================
 
 # 加载用户环境变量（/dsh/profile.env，可手动修改后重启容器生效）
@@ -52,6 +52,57 @@ DSH_HEALTH_URL="http://${DSH_WEB_HOST}:${DSH_WEB_PORT}"
 mkdir -p "$DSH_LOG_DIR" "$NGINX_LOG_DIR" "$RUN_DIR" "$SSL_DIR" "$DSH_HOME"
 
 # ------------------------------------------------------------
+# DSH 日志统一入口（定义必须在 setup_log_pipe 调用之前）
+#   背景：dsh-ctl 插件重启 DSH 时，会用 `spawn(..., { detached: true })`
+#   从「进程外」拉起新 DSH。新进程的 stdout 由 relaunch.mjs 重定向到
+#   $DSH_HOME/dsh-ctl-relaunch.log，完全绕过 entrypoint 的日志管道，
+#   导致 $DSH_LOG 里看不到新 token，用户无法登录。
+#   做法：把 relaunch 日志软链到 $DSH_LOG，让 token 无论从哪条路径
+#   拉起都落到同一个被 tail 的文件里。
+# ------------------------------------------------------------
+sync_dsh_log_alias() {
+    local relaunch_log="${DSH_HOME}/dsh-ctl-relaunch.log"
+    # 若目标已存在且是普通文件，先把内容并入 $DSH_LOG，避免丢历史
+    if [ -f "$relaunch_log" ] && [ ! -L "$relaunch_log" ]; then
+        cat "$relaunch_log" >> "$DSH_LOG" 2>/dev/null || true
+        rm -f "$relaunch_log"
+    fi
+    ln -snf "$DSH_LOG" "$relaunch_log" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------
+# 日志管道：命名 FIFO + 长驻 tee
+#
+# 为什么不用 `dsh web > >(tee ...) &`：
+#   进程替换 `> >(tee)` 建立的是「当前 shell 的子进程」管道。一旦 DSH
+#   被 dsh-ctl 以 detached 方式在进程外重启，旧 tee 随旧 DSH 一同退出，
+#   新 DSH 的输出就再也进不了 $DSH_LOG（正是「重启后日志无 token」的根因）。
+#
+# 改为「命名管道 + 长驻 tee」：
+#   本脚本创建一个 FIFO，并挂一个长驻 `tee`（写 $DSH_LOG + 终端）。
+#   DSH 的 stdout/stderr 绑定到 FIFO 写端（FD 3）。
+#   好处：日志写入方是长驻 tee，与 DSH 生命周期**解耦**。DSH 重启只换
+#   写端进程，tee 与日志文件持续存在，因此重启后的新 token 必定落盘。
+# ------------------------------------------------------------
+LOG_FIFO="${RUN_DIR}/dsh-log.fifo"
+LOG_TEE_PID=""
+
+setup_log_pipe() {
+    rm -f "$LOG_FIFO"
+    mkfifo "$LOG_FIFO" 2>/dev/null || return 0
+    # 长驻 tee：读 FIFO，同时写日志文件与容器终端
+    tee -a "$DSH_LOG" < "$LOG_FIFO" &
+    LOG_TEE_PID=$!
+    # 打开写端常驻 FD 3；先开读端再开写端，避免 open 阻塞
+    exec 3> "$LOG_FIFO"
+}
+
+# 建立日志管道（必须在使用 FD 3 之前完成）
+setup_log_pipe
+# 让 relaunch 日志并入 $DSH_LOG，保证 dsh-ctl 外部重启时 token 不丢
+sync_dsh_log_alias
+
+# ------------------------------------------------------------
 # 清理上一轮残留的 PID 文件，避免 nginx 因 pid 冲突拒绝启动
 # ------------------------------------------------------------
 cleanup_stale_pid() {
@@ -66,7 +117,7 @@ cleanup_stale_pid() {
 }
 
 # ------------------------------------------------------------
-# 启动/重启 DSH：kill 旧进程后重拉，输出同时写日志文件并实时打到终端
+# 启动/重启 DSH：kill 旧进程后重拉，输出经 FD 3 汇入日志（见 setup_log_pipe）
 # ------------------------------------------------------------
 start_dsh() {
     if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
@@ -75,7 +126,9 @@ start_dsh() {
         sleep 1
     fi
     : > "$DSH_LOG"
-    dsh web --no-open > >(tee -a "$DSH_LOG") 2>&1 &
+    sync_dsh_log_alias
+
+    dsh web --no-open >&3 2>&3 &
     DSH_PID=$!
     echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 }
@@ -308,25 +361,94 @@ tail -F \
     2>/dev/null &
 TAIL_PID=$!
 
-# 确保退出时清理子进程
+# 确保退出时清理子进程与日志管道
 cleanup() {
     kill "$TAIL_PID" 2>/dev/null || true
+    if [ -n "$LOG_TEE_PID" ]; then
+        kill "$LOG_TEE_PID" 2>/dev/null || true
+    fi
+    exec 3>&- 2>/dev/null || true
+    rm -f "$LOG_FIFO" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # ------------------------------------------------------------
-# 看护循环：任一核心进程退出则记录日志并以非 0 退出，让容器一并退出
-# （配合 restart_policy: unless-stopped 实现自动拉起）
+# 看护循环（v0.2.3 重写）：以「服务可用性」为准，区分计划内重启与真崩溃
+#
+# 背景：dsh-ctl 插件执行 restart 时，行为是：
+#     1. spawn(relaunch.mjs, detached) —— 独立接力进程
+#     2. 当前 DSH 进程优雅退出（PID 变化）
+#     3. relaunch.mjs 等端口空闲后拉起**新的** DSH
+#   旧实现用 `kill -0 $DSH_PID` 判断，会把「计划内重启」误判为崩溃而
+#   exit 1，容器随之退出 —— 这正是「dshctl 重启导致容器退出」的根因。
+#
+# 新判定策略：
+#   DSH 是「允许换 PID 的有状态服务」，PID 不能作为唯一身份。改为：
+#   a) 以 **服务可用性** 为准：HTTP 探测 DSH_WEB_PORT 有响应即视为存活
+#   b) 服务连续不可达超过宽限窗口（90s，覆盖 relaunch 最长 45s 交接期）
+#      才判定为真故障
+#   c) 服务可用时从端口反查实际 PID，刷新 $DSH_PID 与 dsh.pid
+#      （dsh.pid 由本脚本写入，dsh-ctl 重启后**不会**更新它，
+#        因此该文件会过期，不能作为存活依据）
+#   Nginx 不参与重启交接，保持严格的 PID 判定。
 # ------------------------------------------------------------
+DSH_DOWN_SINCE=0
+DSH_DOWN_GRACE=90   # 容忍重启交接的最大秒数（relaunch.mjs 默认等待窗口 45s + 余量）
+
+dsh_service_alive() {
+    curl -s -o /dev/null --max-time 3 "$DSH_HEALTH_URL" 2>/dev/null
+}
+
+# 从监听端口反查真正在服务的 PID（容器内无 lsof，用 /proc 扫）
+resolve_dsh_pid_by_port() {
+    local hexport
+    hexport="$(printf '%04X' "${DSH_WEB_PORT:-3080}")"
+    local p fd inode pid
+    # 用 while read 逐行消费，避免 for 循环对 awk 输出做词分割（SC2013）
+    while IFS= read -r inode; do
+        [ -z "$inode" ] && continue
+        for p in /proc/[0-9]*; do
+            pid="${p#/proc/}"
+            for fd in "$p"/fd/*; do
+                if [ "$(readlink "$fd" 2>/dev/null)" = "socket:[${inode}]" ]; then
+                    echo "$pid"
+                    return 0
+                fi
+            done
+        done
+    done < <(awk -v h=":$hexport" '
+        $2 ~ h { n = split($10, a, ","); print a[n] }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null)
+    return 1
+}
+
 while true; do
     sleep 10
 
-    if ! kill -0 "$DSH_PID" 2>/dev/null; then
-        echo "  [watchdog] DSH 进程 ($DSH_PID) 已退出，容器即将退出"
-        tail -n 50 "$DSH_LOG" 2>/dev/null || true
-        exit 1
+    if dsh_service_alive; then
+        # 服务可用 => 重置故障计时，并刷新实际 PID（便于日志展示）
+        DSH_DOWN_SINCE=0
+        live_pid="$(resolve_dsh_pid_by_port 2>/dev/null || echo '')"
+        if [ -n "$live_pid" ] && [ "$live_pid" != "$DSH_PID" ]; then
+            echo "  [watchdog] DSH 已由外部重启，实际 PID: $DSH_PID -> $live_pid"
+            DSH_PID="$live_pid"
+            # 同步 PID 文件，避免后续误读过期的旧值
+            echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
+        fi
+    else
+        if [ "$DSH_DOWN_SINCE" -eq 0 ]; then
+            DSH_DOWN_SINCE=$(date +%s)
+            echo "  [watchdog] DSH 服务暂不可达，进入观察窗口（最长 ${DSH_DOWN_GRACE}s）..."
+        fi
+        down_for=$(( $(date +%s) - DSH_DOWN_SINCE ))
+        if [ "$down_for" -ge "$DSH_DOWN_GRACE" ]; then
+            echo "  [watchdog] DSH 服务连续不可达 ${down_for}s（超过 ${DSH_DOWN_GRACE}s 宽限），判定为故障，容器即将退出"
+            tail -n 50 "$DSH_LOG" 2>/dev/null || true
+            exit 1
+        fi
     fi
 
+    # --- Nginx 存活判定（Nginx 不参与重启交接，保持严格判定）---
     if [ -n "$NGINX_PID" ] && ! kill -0 "$NGINX_PID" 2>/dev/null; then
         echo "  [watchdog] Nginx 进程 ($NGINX_PID) 已退出，容器即将退出"
         tail -n 50 "${NGINX_LOG_DIR}/error.log" 2>/dev/null || true

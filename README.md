@@ -10,7 +10,8 @@
 - **版本化配置**：通过 `versions.yml` 管理 DSH 及插件版本，支持组件名+版本号和直接 URL 两种安装方式
 - **Ansible 编排**：提供 Ansible Playbook 读取版本配置并自动部署
 - **健康检查**：Nginx 提供 `/health` 状态页面，启动阶段会校验 Nginx 与 DSH 均就绪才放行
-- **进程看护**：内置 watchdog，DSH 或 Nginx 意外退出时容器会一并退出，便于 `restart_policy` 拉起
+- **进程看护**：内置服务级 watchdog，以 HTTP 可用性判定存活；DSH/Nginx 意外退出时容器一并退出，便于 `restart_policy` 拉起
+- **重启友好**：`dshctl restart` 等计划内重启不会被误判为崩溃，重启后新 token 会追加写入日志
 - **时区可配**：默认北京时间（`Asia/Shanghai`），`date` 与 Nginx 日志时间戳均为东八区
 - **日志集中**：所有日志统一存放在 `/dsh/log/` 下，分类管理
 
@@ -117,7 +118,7 @@ source /dsh/profile.env
 
 ```bash
 # 方式一：临时覆盖（推荐）
-docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.2.2
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.2.3
 
 # 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
 ```
@@ -181,13 +182,13 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
 | 标签 | 含义 | 适用场景 |
 |------|------|----------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.2.2` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
+| `v0.2.3` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
 
 > 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
 > 版本号标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
 
-**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.2.2` 及以上版本。
+**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.2.3` 及以上版本。
 
 > 容器默认使用**北京时间（`Asia/Shanghai`）**，日志与 `date` 均为东八区时间。
 > 详细说明与修改方式见上文「[时区说明](#时区说明)」。
@@ -217,16 +218,31 @@ Playbook 默认映射 `9080:80` 与 `9443:443`，与上面的 `docker run` 保�
 - HTTPS: `https://<服务器IP>:9443/?token=<token>`（自签证书，浏览器需手动信任）
 - 健康检查: `http://<服务器IP>:9080/health`
 
-查看 token：
+查看 token（容器启动后，或**用 `dshctl` 重启之后**都可用）：
 
 ```bash
-docker logs dsh-web 2>&1 | grep -oE 'token=[A-Za-z0-9_-]+' | head -1
+docker logs dsh-web 2>&1 | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
 ```
+
+也可以直接读日志文件，二者内容一致：
+
+```bash
+# 容器内
+cat /dsh/log/dsh/dsh-web.log | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
+```
+
+> `dshctl` 在容器外重启 DSH 后，日志会**追加**新 token（旧 token 记录保留），
+> 因此用 `tail -1` 取最后一个即为当前有效 token。
 
 ### 容器自愈
 
-容器内置进程看护：DSH 或 Nginx 意外退出时，容器会一并退出。
-配合 `--restart unless-stopped`（上面的示例已包含）即可实现故障自动恢复。
+容器内置**服务级**看护：
+
+- DSH 或 Nginx **意外退出**时，容器会一并退出；
+  配合 `--restart unless-stopped`（上面的示例已包含）即可实现故障自动恢复。
+- 通过 `dshctl` 执行的**计划内重启**（`/dshctl/restart`）不会被误判为崩溃：
+  看护以 **HTTP 服务可用性** 为准，并给出 90 秒交接宽限窗口，
+  重启完成后自动识别新进程 PID，容器持续运行。
 
 ## 开发
 
@@ -242,11 +258,11 @@ bash test/test_versions_parser.sh
 ### 发布新版本
 
 ```bash
-git tag -a v0.2.2 -m "v0.2.2: 变更说明"
-git push origin v0.2.2
+git tag -a v0.2.3 -m "v0.2.3: 变更说明"
+git push origin v0.2.3
 ```
 
-推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.2.2`、`latest` 与 `sha-*` 标签。
+推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.2.3`、`latest` 与 `sha-*` 标签。
 
 ## License
 
