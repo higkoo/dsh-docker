@@ -143,7 +143,8 @@ ENV DSH_HOME=/dsh/home
 ENV PATH="/dsh/apps/nodejs/bin:/dsh/apps/python/bin:/dsh/apps/python/venv/bin:${PATH}"
 ENV HOSTNAME=dsh-agent
 
-EXPOSE 80 8233
+# 端口说明：外部 8233->80(HTTP)，外部 8443->443(HTTPS/SSL)
+EXPOSE 80 443
 WORKDIR /dsh
 
 ENTRYPOINT ["/dsh/script/entrypoint.sh"]
