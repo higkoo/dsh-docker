@@ -13,11 +13,11 @@ set -e
 #   7. 前台跟踪日志
 # ============================================================
 
-# DSH_ROOT: 绿色安装根目录（apps, config, log, script 等）
+# DSH_ROOT: 绿色安装根目录（app, config, log, script 等）
 export DSH_ROOT="${DSH_ROOT:-/dsh}"
 # DSH_HOME: DSH 的数据目录（profile、插件等）
 export DSH_HOME="${DSH_HOME:-/dsh/home}"
-export PATH="${DSH_ROOT}/apps/nodejs/bin:${DSH_ROOT}/apps/python/bin:${DSH_ROOT}/apps/python/venv/bin:${PATH}"
+export PATH="${DSH_ROOT}/app/nodejs/bin:${DSH_ROOT}/app/python/bin:${DSH_ROOT}/app/python/venv/bin:${PATH}"
 
 DSH_LOG_DIR="${DSH_ROOT}/log/dsh"
 NGINX_LOG_DIR="${DSH_ROOT}/log/nginx"
@@ -108,13 +108,23 @@ else
 fi
 
 # ============================================================
-# 6. 触发 DSH 重启（确保插件生效后重启一次）
+# 6. 重启 DSH 确保插件生效
+#    手动结束进程并重拉，保证新 token 写入 DSH_LOG
+#    （dshctl/restart 由 dsh 内部 fork 进程，stdout 不再进入 DSH_LOG，会抓不到 token）
 # ============================================================
-echo "触发 DSH 重启 (curl POST /dshctl/restart)..."
-curl -s -X POST http://127.0.0.1:3080/dshctl/restart || echo "  重启请求失败，继续..."
+echo "重启 DSH 以确保插件生效..."
+if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
+    kill "$DSH_PID" 2>/dev/null || true
+    wait "$DSH_PID" 2>/dev/null || true
+    sleep 1
+fi
+
+: > "$DSH_LOG"
+dsh web --no-open > "$DSH_LOG" 2>&1 &
+DSH_PID=$!
+echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 
 echo "等待 DSH 重新就绪..."
-: > "$DSH_LOG"
 for i in $(seq 1 60); do
     if curl -s http://127.0.0.1:3080 >/dev/null 2>&1; then
         echo "  DSH 已重新就绪 (等待 ${i}s)"
@@ -129,24 +139,33 @@ for i in $(seq 1 60); do
 done
 
 # ============================================================
-# 7. 提取访问 token
+# 7. 提取访问 token 及 LAN 地址（插件生效标志）
 # ============================================================
 TOKEN=""
-for i in $(seq 1 15); do
+for i in $(seq 1 30); do
     TOKEN=$(grep -oE 'token=[A-Za-z0-9_-]+' "$DSH_LOG" | head -1 | cut -d= -f2)
     [ -n "$TOKEN" ] && break
     sleep 1
 done
 
 if [ -n "$TOKEN" ]; then
+    # 提取 dsh web 启动行（含 LAN 地址，判断 lan 插件是否加载成功）
+    WEB_LINE=$(grep -E 'dsh web:' "$DSH_LOG" | tail -1)
+    LAN_URL=$(echo "$WEB_LINE" | grep -oE 'LAN: [^ )]+' | sed 's/LAN: //')
     echo "============================================================"
     echo "  DSH 已启动！请访问:"
     echo "    HTTP : http://<Your-IP>:8233/?token=${TOKEN}"
     echo "    HTTPS: https://<Your-IP>:8443/?token=${TOKEN}"
+    if [ -n "$LAN_URL" ]; then
+        echo "  LAN 访问(插件已生效): $LAN_URL"
+    else
+        echo "  警告: 未检测到 LAN 访问地址，dsh-web-lan-access 插件可能未加载成功"
+    fi
     echo "  健康检查页面: http://<Your-IP>:8233/health"
     echo "============================================================"
 else
     echo "  未抓到 token，请查看日志: $DSH_LOG"
+    cat "$DSH_LOG"
 fi
 
 # ============================================================
