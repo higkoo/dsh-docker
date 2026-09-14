@@ -52,22 +52,39 @@ DSH_HEALTH_URL="http://${DSH_WEB_HOST}:${DSH_WEB_PORT}"
 mkdir -p "$DSH_LOG_DIR" "$NGINX_LOG_DIR" "$RUN_DIR" "$SSL_DIR" "$DSH_HOME"
 
 # ------------------------------------------------------------
-# DSH 日志统一入口（定义必须在 setup_log_pipe 调用之前）
-#   背景：dsh-ctl 插件重启 DSH 时，会用 `spawn(..., { detached: true })`
-#   从「进程外」拉起新 DSH。新进程的 stdout 由 relaunch.mjs 重定向到
-#   $DSH_HOME/dsh-ctl-relaunch.log，完全绕过 entrypoint 的日志管道，
-#   导致 $DSH_LOG 里看不到新 token，用户无法登录。
-#   做法：把 relaunch 日志软链到 $DSH_LOG，让 token 无论从哪条路径
-#   拉起都落到同一个被 tail 的文件里。
+# 把 dsh-ctl 的重启日志归位到 /dsh/log/plugins/ 下
+#
+# 背景：dsh-ctl 插件重启 DSH 时，会用 `spawn(..., { detached: true })`
+#   从「进程外」拉起新 DSH。relaunch.mjs 把新进程的 stdout 默认写到
+#   $DSH_HOME/dsh-ctl-relaunch.log（DSH_HOME=/dsh/home，是个隐藏得很深
+#   的数据目录，不属于日志目录），用户按惯例去 /dsh/log/ 找日志时找不到，
+#   会误以为「重启后没有 token」。
+#
+# 做法：让 dsh-ctl 仍然写它约定好的那个路径，但把该路径做成
+#   指向 /dsh/log/plugins/dsh-ctl-relaunch.log 的软链 ——
+#   - 插件行为零改动（无需改第三方包）
+#   - 日志物理落在统一的 /dsh/log/ 目录树下，`tail /dsh/log/*/*.log` 可见
+#   - 旧路径依旧可读（软链），不会破坏任何既有引用
 # ------------------------------------------------------------
+DSH_CTL_LOG_DIR="${DSH_ROOT}/log/plugins"
+DSH_CTL_RELAUNCH_LOG="${DSH_CTL_LOG_DIR}/dsh-ctl-relaunch.log"
+
 sync_dsh_log_alias() {
-    local relaunch_log="${DSH_HOME}/dsh-ctl-relaunch.log"
-    # 若目标已存在且是普通文件，先把内容并入 $DSH_LOG，避免丢历史
-    if [ -f "$relaunch_log" ] && [ ! -L "$relaunch_log" ]; then
-        cat "$relaunch_log" >> "$DSH_LOG" 2>/dev/null || true
-        rm -f "$relaunch_log"
+    local legacy_log="${DSH_HOME}/dsh-ctl-relaunch.log"
+    mkdir -p "$DSH_CTL_LOG_DIR"
+
+    # 旧路径残留的是普通文件（历史日志）：内容并入新位置后清掉
+    if [ -f "$legacy_log" ] && [ ! -L "$legacy_log" ]; then
+        cat "$legacy_log" >> "$DSH_CTL_RELAUNCH_LOG" 2>/dev/null || true
+        rm -f "$legacy_log"
     fi
-    ln -snf "$DSH_LOG" "$relaunch_log" 2>/dev/null || true
+
+    # 预先建好目标文件：一方面作为软链的落点，另一方面保证它出现在
+    # `tail -F /dsh/log/*/*.log` 的通配展开结果里（首次重启前也能被跟踪）
+    : >> "$DSH_CTL_RELAUNCH_LOG"
+
+    # 旧路径改为指向新位置的软链，兼容 dsh-ctl 的硬编码写入
+    ln -snf "$DSH_CTL_RELAUNCH_LOG" "$legacy_log" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------
@@ -352,13 +369,27 @@ fi
 #    原实现只 tail 日志，DSH/Nginx 挂掉后容器仍显示 running。
 #    关键：看护逻辑必须跑在主流程（PID 1）里，子 shell 中的 exit
 #    只会终止子 shell，不会让容器退出。
+#
+#    日志跟踪改为「覆盖 /dsh/log/*/*.log 全部日志」：
+#      凡是有新日志文件出现（含插件后续新增的），无需改脚本即可被看到。
+#      通配符在 tail 启动时展开；`tail -F` 会按文件名跟踪并自动处理轮转
+#      （文件被删除/重建后仍继续跟踪）。
 # ============================================================
-echo "开始跟踪日志..."
-tail -F \
-    "${NGINX_LOG_DIR}/access.log" \
-    "${NGINX_LOG_DIR}/error.log" \
-    "$DSH_LOG" \
-    2>/dev/null &
+echo "开始跟踪日志 ($DSH_ROOT/log/*/*.log)..."
+# nullglob：无匹配时数组为空，避免把字面量 "/dsh/log/*/*.log" 传给 tail
+shopt -s nullglob
+LOG_FILES=("${DSH_ROOT}"/log/*/*.log)
+shopt -u nullglob
+# 若通配无匹配（理论不会），退回已知的核心日志
+if [ "${#LOG_FILES[@]}" -eq 0 ]; then
+    LOG_FILES=(
+        "${NGINX_LOG_DIR}/access.log"
+        "${NGINX_LOG_DIR}/error.log"
+        "$DSH_LOG"
+    )
+fi
+
+tail -F "${LOG_FILES[@]}" 2>/dev/null &
 TAIL_PID=$!
 
 # 确保退出时清理子进程与日志管道
