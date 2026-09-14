@@ -102,6 +102,8 @@ RUN mkdir -p /dsh/apps/nodejs/lib/node_modules/pnpm \
     && curl -fsSL -o /tmp/pnpm.tgz "https://registry.npmmirror.com/pnpm/-/pnpm-12.4.1.tgz" \
     && tar -xzf /tmp/pnpm.tgz -C /dsh/apps/nodejs/lib/node_modules/pnpm --strip-components=1 \
     && rm -f /tmp/pnpm.tgz \
+    # npm tarball 解压不保留 bin 的可执行位，这里显式补上（否则 dsh plugin add 会 spawn pnpm EACCES）
+    && chmod +x /dsh/apps/nodejs/lib/node_modules/pnpm/bin/pnpm.mjs \
     && ln -sf /dsh/apps/nodejs/lib/node_modules/pnpm/bin/pnpm.mjs /dsh/apps/nodejs/bin/pnpm \
     && ln -sf /dsh/apps/nodejs/lib/node_modules/pnpm/bin/pnpm.mjs /usr/local/bin/pnpm \
     && echo "pnpm 12.4.1 installed from tarball"
@@ -141,7 +143,7 @@ ENV DSH_HOME=/dsh/home
 ENV PATH="/dsh/apps/nodejs/bin:/dsh/apps/python/bin:/dsh/apps/python/venv/bin:${PATH}"
 ENV HOSTNAME=dsh-agent
 
-EXPOSE 80
+EXPOSE 80 8233
 WORKDIR /dsh
 
 ENTRYPOINT ["/dsh/script/entrypoint.sh"]
