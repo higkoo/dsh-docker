@@ -38,9 +38,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
-            type=raw,value=${{ env.VERSION }},enable=${{ github.ref == 'refs/heads/master' }}
-            type=ref,event=branch
+            type=raw,value=latest
+            type=raw,value=v0.1.2
             type=sha,format=short
 
       - name: Build and push image
