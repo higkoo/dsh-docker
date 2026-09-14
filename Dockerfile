@@ -1,5 +1,16 @@
 FROM debian:trixie-slim
 
+# ============================================================
+# 0. OCI 元数据标注
+#    这些注解会显示在 ghcr.io 的 package 页面上
+#    - source:      关联源仓库，Package 页面会自动展示该仓库的 README
+#    - description: 单行描述，显示在包名下方（限 512 字符）
+#    - licenses:    SPDX 许可证标识，显示在详情侧栏
+# ============================================================
+LABEL org.opencontainers.image.source="https://github.com/higkoo/dsh-docker"
+LABEL org.opencontainers.image.description="DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"
+LABEL org.opencontainers.image.licenses="MIT"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ============================================================

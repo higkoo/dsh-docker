@@ -95,5 +95,11 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # package 描述/来源/许可证通过 OCI 注解写入 manifest。
+          # 注意：单平台构建须用 `annotation.` 前缀；若将来改为多平台
+          # （--platform linux/amd64,linux/arm64），需改用
+          # `annotation-index.` 前缀，否则 buildx 会报
+          # "index annotations not supported for single platform export"。
+          outputs: "type=image,name=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }},annotation.org.opencontainers.image.description=DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。,annotation.org.opencontainers.image.source=https://github.com/higkoo/dsh-docker,annotation.org.opencontainers.image.licenses=MIT"
           cache-from: type=gha
           cache-to: type=gha,mode=max
