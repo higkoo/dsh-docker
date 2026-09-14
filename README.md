@@ -153,7 +153,7 @@ plugins:
 git clone https://github.com/higkoo/dsh-docker.git
 cd dsh-docker
 docker build -t dsh .
-docker run -d --name dsh-web --hostname dsh-web -p 9080:80 -p 9443:443 dsh
+docker run -d --name dsh-web -p 9080:80 -p 9443:443 dsh
 ```
 
 ### Ansible 部署
