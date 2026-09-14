@@ -86,6 +86,13 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ env.VERSION }},enable=${{ env.VERSION != '' }}
             type=sha,format=short
+          # 以下三项决定 ghcr.io package 页面显示的内容。
+          # 注意：metadata-action 会覆盖 Dockerfile 中的同名 LABEL，
+          # 因此这里必须显式声明，否则会被仓库描述填充或置空。
+          labels: |
+            org.opencontainers.image.title=dsh-docker
+            org.opencontainers.image.description=DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。
+            org.opencontainers.image.licenses=MIT
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -95,10 +102,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # package 描述/来源/许可证通过 OCI 注解写入 manifest。
-          # 注意：单平台构建须用 `annotation.` 前缀；若将来改为多平台
-          # （--platform linux/amd64,linux/arm64），需改用
-          # `annotation-index.` 前缀，否则 buildx 会报
+          # 单平台镜像的 OCI 注解需写入 manifest（annotation. 前缀）。
+          # 若将来改为多平台构建（--platform linux/amd64,linux/arm64），
+          # 必须改用 annotation-index. 前缀，否则 buildx 会报
           # "index annotations not supported for single platform export"。
           outputs: "type=image,name=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }},annotation.org.opencontainers.image.description=DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。,annotation.org.opencontainers.image.source=https://github.com/higkoo/dsh-docker,annotation.org.opencontainers.image.licenses=MIT"
           cache-from: type=gha
