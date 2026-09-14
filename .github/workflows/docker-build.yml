@@ -86,13 +86,14 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ env.VERSION }},enable=${{ env.VERSION != '' }}
             type=sha,format=short
-          # 以下三项决定 ghcr.io package 页面显示的内容。
-          # 注意：metadata-action 会覆盖 Dockerfile 中的同名 LABEL，
-          # 因此这里必须显式声明，否则会被仓库描述填充或置空。
+          # 注意：metadata-action 会自动从仓库元数据派生
+          # `manifest:org.opencontainers.image.description` 与 `...licenses`，
+          # 这组 manifest: 标签优先级高于此处手动声明的 labels，
+          # 因此 description 与 license 的**真正来源是仓库设置**
+          # （Settings → Description / License），不要在此重复声明，
+          # 否则会出现两套值并存且被 manifest: 覆盖的困惑。
           labels: |
             org.opencontainers.image.title=dsh-docker
-            org.opencontainers.image.description=DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。
-            org.opencontainers.image.licenses=MIT
 
       - name: Build and push image
         uses: docker/build-push-action@v6
