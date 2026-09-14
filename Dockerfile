@@ -143,7 +143,7 @@ ENV DSH_HOME=/dsh/home
 ENV PATH="/dsh/apps/nodejs/bin:/dsh/apps/python/bin:/dsh/apps/python/venv/bin:${PATH}"
 ENV HOSTNAME=dsh-agent
 
-EXPOSE 80
+EXPOSE 80 8233
 WORKDIR /dsh
 
 ENTRYPOINT ["/dsh/script/entrypoint.sh"]

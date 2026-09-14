@@ -22,10 +22,9 @@ export PATH="${DSH_ROOT}/apps/nodejs/bin:${DSH_ROOT}/apps/python/bin:${DSH_ROOT}
 DSH_LOG_DIR="${DSH_ROOT}/log/dsh"
 NGINX_LOG_DIR="${DSH_ROOT}/log/nginx"
 RUN_DIR="${DSH_ROOT}/run"
-SSL_DIR="${DSH_ROOT}/config/nginx/ssl"
 DSH_LOG="${DSH_LOG_DIR}/dsh-web.log"
 
-mkdir -p "$DSH_LOG_DIR" "$NGINX_LOG_DIR" "$RUN_DIR" "$SSL_DIR" "$DSH_HOME"
+mkdir -p "$DSH_LOG_DIR" "$NGINX_LOG_DIR" "$RUN_DIR" "$DSH_HOME"
 
 # ============================================================
 # 1. 安装 DSH 及插件（如果尚未安装）
@@ -49,21 +48,7 @@ else
 fi
 
 # ============================================================
-# 2. 生成自签 SSL 证书（仅在证书不存在时生成）
-# ============================================================
-if [ ! -f "${SSL_DIR}/dsh.crt" ]; then
-    echo "生成自签证书..."
-    openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout "${SSL_DIR}/dsh.key" \
-        -out "${SSL_DIR}/dsh.crt" \
-        -days 3650 \
-        -subj "/C=CN/ST=Shanghai/L=Shanghai/O=Marivo/OU=DevOps/CN=higkoo" \
-        -addext "subjectAltName=IP:0.0.0.0,DNS:*"
-    echo "自签证书已生成: ${SSL_DIR}/"
-fi
-
-# ============================================================
-# 3. 启动 DSH Web UI（后台，日志重定向到文件）
+# 2. 启动 DSH Web UI（后台，日志重定向到文件）
 # ============================================================
 echo "启动 DSH Web UI..."
 : > "$DSH_LOG"
@@ -73,7 +58,7 @@ echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 echo "  DSH PID: $DSH_PID"
 
 # ============================================================
-# 4. 等待 DSH 就绪
+# 3. 等待 DSH 就绪
 # ============================================================
 echo "等待 DSH 就绪..."
 for i in $(seq 1 60); do
@@ -90,9 +75,9 @@ for i in $(seq 1 60); do
 done
 
 # ============================================================
-# 5. 启动 Nginx 反向代理（80 端口）
+# 4. 启动 Nginx 反向代理（80 端口）
 # ============================================================
-echo "启动 Nginx 反向代理 (port 80)..."
+echo "启动 Nginx 反向代理 (port 80/8233)..."
 nginx -c "${DSH_ROOT}/config/nginx/nginx.conf" 2>&1 &
 NGINX_PID=$!
 echo "$NGINX_PID" > "${RUN_DIR}/nginx.pid"
@@ -107,7 +92,7 @@ else
 fi
 
 # ============================================================
-# 6. 触发 DSH 重启（确保插件生效后重启一次）
+# 5. 触发 DSH 重启（确保插件生效后重启一次）
 # ============================================================
 echo "触发 DSH 重启 (curl POST /dshctl/restart)..."
 curl -s -X POST http://127.0.0.1:3080/dshctl/restart || echo "  重启请求失败，继续..."
@@ -128,7 +113,7 @@ for i in $(seq 1 60); do
 done
 
 # ============================================================
-# 7. 提取访问 token
+# 6. 提取访问 token
 # ============================================================
 TOKEN=""
 for i in $(seq 1 15); do
@@ -139,7 +124,7 @@ done
 
 if [ -n "$TOKEN" ]; then
     echo "============================================================"
-    echo "  DSH 已启动！请访问: http://<Your-IP>/?token=${TOKEN}"
+    echo "  DSH 已启动！请访问: http://<Your-IP>:8233/?token=${TOKEN}"
     echo "  健康检查页面: http://<Your-IP>/health"
     echo "============================================================"
 else
@@ -147,7 +132,7 @@ else
 fi
 
 # ============================================================
-# 8. 前台跟踪日志（Nginx + DSH）
+# 7. 前台跟踪日志（Nginx + DSH）
 # ============================================================
 echo "开始跟踪日志..."
 tail -f \
