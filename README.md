@@ -147,6 +147,29 @@ plugins:
 
 ## 使用方法
 
+### 使用预构建镜像（推荐）
+
+无需本地构建，直接从 GitHub Container Registry 拉取：
+
+```bash
+docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
+  -p 9080:80 -p 9443:443 \
+  ghcr.io/higkoo/dsh:latest
+```
+
+**镜像标签说明**：
+
+| 标签 | 含义 | 适用场景 |
+|------|------|----------|
+| `latest` | 最新稳定版 | 日常使用 |
+| `v0.2.0` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
+| `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
+
+> 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
+> 版本号标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
+
+**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.2.0` 及以上版本。
+
 ### Docker 构建
 
 ```bash
@@ -171,6 +194,37 @@ Playbook 默认映射 `9080:80` 与 `9443:443`，与上面的 `docker run` 保�
 - DSH Web UI: `http://<服务器IP>:9080/?token=<token>`（token 在容器启动日志中输出）
 - HTTPS: `https://<服务器IP>:9443/?token=<token>`（自签证书，浏览器需手动信任）
 - 健康检查: `http://<服务器IP>:9080/health`
+
+查看 token：
+
+```bash
+docker logs dsh-web 2>&1 | grep -oE 'token=[A-Za-z0-9_-]+' | head -1
+```
+
+### 容器自愈
+
+容器内置进程看护：DSH 或 Nginx 意外退出时，容器会一并退出。
+配合 `--restart unless-stopped`（上面的示例已包含）即可实现故障自动恢复。
+
+## 开发
+
+### 运行测试
+
+```bash
+bash test/test_versions_parser.sh
+```
+
+覆盖 `versions.yml` 解析器的边界场景（行尾注释、引号、含 `#` 的 URL、多插件、
+`set -e` 中断回归等），CI 中同步执行。
+
+### 发布新版本
+
+```bash
+git tag -a v0.2.1 -m "v0.2.1: 变更说明"
+git push origin v0.2.1
+```
+
+推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.2.1`、`latest` 与 `sha-*` 标签。
 
 ## License
 
