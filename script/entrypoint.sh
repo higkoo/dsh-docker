@@ -6,11 +6,10 @@ set -e
 # 流程：
 #   1. 检查/安装 DSH 及插件（读取 versions.yml），并验证插件注册
 #   2. 生成自签 SSL 证书
-#   3. 启动 DSH Web UI（日志经 FIFO 汇入 dsh-web.log + 终端）
-#   4. 启动 Nginx 反向代理（80 / 443）
-#   5. 确认插件生效并抓取访问 token（以 `dsh web: <url>` 行为准，最多 3 轮）
-#   6. 输出访问地址
-#   7. 前台看护（服务级健康检查，容忍 dsh-ctl 计划内重启）
+#   3. 启动 Nginx 反向代理（80 / 443）
+#   4. 启动 DSH Web UI 并抓取访问 token（以 LAN: 日志行为准，最多 3 轮）
+#   5. 输出访问地址
+#   6. 前台看护（服务级健康检查，容忍 dsh-ctl 计划内重启）
 # ============================================================
 
 # 加载用户环境变量（/dsh/profile.env，可手动修改后重启容器生效）
@@ -112,6 +111,8 @@ sync_dsh_log_alias() {
 # ------------------------------------------------------------
 LOG_FIFO="${RUN_DIR}/dsh-log.fifo"
 LOG_TEE_PID=""
+# DSH 启动次数计数器，仅用于日志分隔标记（便于区分多轮重试）
+DSH_START_COUNT=0
 
 setup_log_pipe() {
     rm -f "$LOG_FIFO"
@@ -152,34 +153,37 @@ start_dsh() {
         sleep 1
     fi
 
-    # 不要清空 $DSH_LOG。
+    # 注意：这里不要清空 $DSH_LOG。
     #
-    # 历史实现里这里是 `: > "$DSH_LOG"`，每次启动都截断日志，
-    # 结果就是「第一次启动的 token 被第二次启动抹掉」，dsh.log 看起来总是空的。
-    # 启动日志体量极小（正常只有一行 `dsh web: ...` 或一段启动异常栈），
-    # 保留历史反而对排查有用：能直接看到每一轮的启动记录。
+    # 旧实现是 `: > "$DSH_LOG"`，每次启动都截断。而本脚本第 3 节先启动过一次
+    # DSH（拿到 token 并写入日志），第 6 节的 for 循环又调用 start_dsh 重启，
+    # 于是第 3 节那次启动的 token 记录被这句截断直接抹掉——
+    # 这正是「服务正常启动，日志里却看不到启动记录 / dsh.log 是空的」的根因。
     #
-    # 若确实想每轮清空（例如日志被异常刷屏），把下面这行取消注释即可：
+    # 启动日志体量极小（正常一行 `dsh web: ...`，异常时一段栈），
+    # 保留历史反而便于对照每一次启动。
+    #
+    # 若确实需要每轮清空，把下面这行取消注释即可：
     #   : > "$DSH_LOG"
     sync_dsh_log_alias
 
-    # 打印分隔标记，便于在日志里区分第 N 次启动（多轮重试时尤其有用）
+    # 写入带时间戳的分隔标记：多轮重试（最多 3 轮）时能一眼区分第几次启动。
     if [ -w "$DSH_LOG" ]; then
-        echo "----- dsh web 启动 @ $(date '+%Y-%m-%d %H:%M:%S') -----" >> "$DSH_LOG"
+        DSH_START_COUNT=$((DSH_START_COUNT + 1))
+        {
+            echo "----- dsh web 启动 #${DSH_START_COUNT} @ $(date '+%Y-%m-%d %H:%M:%S') -----"
+        } >> "$DSH_LOG"
     fi
 
-    # 不传 --no-open：--no-open 会连启动地址一起关掉。
+    # 保留 --no-open：它只表示「不要自动打开浏览器」，不影响启动日志里的
+    # `dsh web: <url>?token=...` 那一行（实测该行照常输出）。
+    # 容器内没有浏览器，即便不传也只是多打一行 "opening the default browser" 提示，
+    # 传上更干净。
     #
-    # @deepseek-ai/dsh-web-app 的 startup.js 把 `--no-open` 映射为
-    # openBrowser=false；而 index.js 中打印 URL 的条件是 config.printUrl
-    # （默认 true，独立于 openBrowser）。容器里没有浏览器可开，开浏览器
-    # 那步失败只会往 stderr 打一行提示，不影响服务；但一旦加了 --no-open，
-    # 启动地址就再也不打印，脚本自然永远抓不到 token、也永远看不到 "LAN:" 行。
-    #
-    # 说明：本容器是 127.0.0.1 绑定（见 DSH_WEB_HOST），dsh-web-app 的
-    # resolveLanTrust 只在 0.0.0.0 绑定时才会产出 LAN 地址，因此这里
-    # 正常不会出现 "(LAN: ...)"。外部访问由 nginx 反代 + token 承担。
-    dsh web >&3 2>&3 &
+    # 不要额外传 --host / --port：dsh-web-lan-access 插件已在 cordis.patch.yml
+    # 里把 webserver 绑定覆写为 0.0.0.0（这正是 LAN 段能出现的前提），
+    # 脚本不必也不应再干预监听参数。
+    dsh web --no-open >&3 2>&3 &
     DSH_PID=$!
     echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 }
@@ -285,20 +289,7 @@ if [ ! -f "${SSL_DIR}/dsh.crt" ]; then
 fi
 
 # ============================================================
-# 3. 启动 DSH Web UI（日志实时显示到终端 + 写入文件）
-# ============================================================
-echo "启动 DSH Web UI..."
-start_dsh
-echo "  DSH PID: $DSH_PID"
-
-# ============================================================
-# 4. 等待 DSH 就绪
-# ============================================================
-echo "等待 DSH 就绪..."
-wait_dsh_ready "DSH" || exit 1
-
-# ============================================================
-# 5. 启动 Nginx 反向代理（80 / 443）
+# 3. 启动 Nginx 反向代理（80 / 443）
 #    nginx 默认以 daemon 模式运行：master 进程 fork 后父进程退出，
 #    因此不能靠 `&` + $! 取 PID（拿到的是已退出的父进程）。
 #    改为同步调用并检查退出码，PID 以 nginx 自己写入的 pid 文件为准。
@@ -350,59 +341,54 @@ else
 fi
 
 # ============================================================
-# 6. 确认插件已生效并抓取访问 token
+# 4. 启动 DSH 并抓取访问 token
+#    插件在 dsh 启动时加载；以 dsh web 日志出现 "LAN:" 行作为
+#    dsh-web-lan-access 生效标志，未出现则自动重启重试，最多 3 轮。
 #
-#    背景（2026-09 修正）：
-#      旧实现以 dsh web 日志出现 "LAN:" 行作为「dsh-web-lan-access 生效」
-#      的判据，并为此最多重启 3 轮。但 "LAN:" 从来不会出现，原因有二：
-#
-#        1) dsh-web-app 打印的是 `dsh web: <url> (LAN: <url>)`，而 LAN 段
-#           只有在 webserver 绑定 0.0.0.0 时才有值（resolveLanTrust 里
-#           `bindHost === "0.0.0.0"` 才采样非内部 IPv4）。本容器固定绑
-#           127.0.0.1（DSH_WEB_HOST），所以 lanUrl 恒为 undefined。
-#        2) 更关键的是，旧实现给 dsh 传了 `--no-open`。startup.js 把
-#           `--no-open` 映射为 openBrowser=false，而 index.js 中打印
-#           整行 URL 的条件是 printUrl——一旦走 --no-open 分支，连
-#           `dsh web: ...` 这一行都完全不输出。
-#
-#      两个原因叠加，就出现了「服务正常启动、脚本却永远抓不到 token、
-#      日志里也什么都没有、还要空转 3 轮 × 30 秒」的现象。
-#
-#    现在的判据改为：以 `dsh web: <url>` 行为准（token 就在这行里），
-#      既天然证明「插件/服务已就绪」，也一次拿到 token，无需反复重启。
-#      图省事但也足够严谨：拿不到 URL 行才重试，最多 3 轮。
+#    实测（dsh-web-app 0.1.5-rc.1）：
+#      - 插件生效时日志为
+#          dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)
+#      - 插件把 webserver 绑定改成 0.0.0.0，因此 LAN 段才会出现；
+#        不带该插件时只有前半段，此时也不会重试（见下方判据）。
+#      - --no-open 只表示“不要自动开浏览器”，不影响该行输出，故保留。
 # ============================================================
-echo "确认 DSH 就绪并获取访问 token..."
+echo "启动 DSH Web UI..."
 TOKEN=""
 WEB_URL=""
 LAN_URL=""
 for round in 1 2 3; do
     start_dsh
 
-    echo "等待 DSH 重新就绪 (第 ${round}/3 轮)..."
+    echo "等待 DSH 就绪 (第 ${round}/3 轮)..."
     wait_dsh_ready "DSH" || exit 1
 
-    # 轮询提取启动 URL（dsh-web-app 在 ready 后打印，落盘可能略有延迟）
-    for _ in $(seq 1 15); do
-        # `dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)`
-        WEB_URL="$(grep -oE 'dsh web: [^ ]+' "$DSH_LOG" 2>/dev/null | tail -1 | sed 's/^dsh web: //' || true)"
-        if [ -n "$WEB_URL" ]; then break; fi
+    # 轮询提取 token（等待日志落盘；Node 写管道有缓冲，需给足时间）
+    for _ in $(seq 1 30); do
+        TOKEN="$(grep -oE 'token=[A-Za-z0-9_-]+' "$DSH_LOG" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+        if [ -n "$TOKEN" ]; then break; fi
         sleep 1
     done
 
-    if [ -n "$WEB_URL" ]; then
-        TOKEN="$(printf '%s' "$WEB_URL" | grep -oE 'token=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2 || true)"
-        # LAN 段属可选（仅 0.0.0.0 绑定时出现），有则顺带记录
-        LAN_URL="$(grep -oE '\(LAN: [^)]+\)' "$DSH_LOG" 2>/dev/null | tail -1 | sed -e 's/^(LAN: //' -e 's/)$//' || true)"
-        echo "  DSH 启动地址已捕获 (第 ${round} 轮)"
+    # LAN: 行是 dsh-web-lan-access 插件生效的标志（取最新一次启动的记录）
+    LAN_URL="$(grep -oE 'LAN: [^ )]+' "$DSH_LOG" 2>/dev/null | tail -1 | sed 's/LAN: //' || true)"
+
+    if [ -n "$LAN_URL" ]; then
+        echo "  LAN 插件已生效 (第 ${round} 轮): $LAN_URL"
         break
     fi
 
-    echo "  第 ${round} 轮未捕获到启动地址，自动重启 DSH 重试..."
+    # 已拿到 token 但没 LAN：说明插件没装/没生效，再重启也无益，
+    # 直接退出循环，避免空转两轮（各 30 秒）。
+    if [ -n "$TOKEN" ]; then
+        echo "  已获取 token，但未检测到 LAN 地址（插件可能未生效），停止重试"
+        break
+    fi
+
+    echo "  第 ${round} 轮未检测到 token，自动重启 DSH 重试..."
 done
 
 # ============================================================
-# 7. 输出访问地址
+# 5. 输出访问地址
 # ============================================================
 if [ -n "$TOKEN" ]; then
     echo "============================================================"
@@ -421,7 +407,7 @@ else
 fi
 
 # ============================================================
-# 8. 日志跟踪（后台）+ 进程看护（前台，作为 PID 1 的主流程）
+# 6. 日志跟踪（后台）+ 进程看护（前台，作为 PID 1 的主流程）
 #    原实现只 tail 日志，DSH/Nginx 挂掉后容器仍显示 running。
 #    关键：看护逻辑必须跑在主流程（PID 1）里，子 shell 中的 exit
 #    只会终止子 shell，不会让容器退出。

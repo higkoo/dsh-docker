@@ -195,7 +195,7 @@ source /dsh/profile.env
 
 ```bash
 # 方式一：临时覆盖（推荐）
-docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.1
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.3
 
 # 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
 ```
@@ -274,14 +274,14 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
 | 标签 | 含义 | 适用场景 |
 |------|------|----------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.3.1` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
+| `v0.3.3` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
 | `v0.3` | 次版本浮动标签，随补丁自动更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
 
 > 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
 > 版本号标签、`X.Y` 浮动标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
 
-**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.1` 及以上版本。
+**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.3` 及以上版本。
 
 > 容器默认使用**北京时间（`Asia/Shanghai`）**，日志与 `date` 均为东八区时间。
 > 详细说明与修改方式见上文「[时区说明](#时区说明)」。
@@ -371,11 +371,11 @@ bash test/test_versions_parser.sh
 ### 发布新版本
 
 ```bash
-git tag -a v0.3.1 -m "v0.3.1: 变更说明"
-git push origin v0.3.1
+git tag -a v0.3.3 -m "v0.3.3: 变更说明"
+git push origin v0.3.3
 ```
 
-推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.1`、`v0.3`、`latest` 与 `sha-*` 标签。
+推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.3`、`v0.3`、`latest` 与 `sha-*` 标签。
 
 ## License
 
