@@ -6,6 +6,8 @@
 
 - **绿色安装**：所有组件（Node.js 24、Python 3.14、Nginx）安装在 `/dsh` 目录下，不污染系统
 - **软链接**：核心二进制软链接到 `/usr/local/bin`，全局可用
+- **可选组件**：Python 由构建参数 `PYTHON_MODE` 控制，默认用 apt 装发行版自带版本，需要锁定版本时可切源码编译（[详见](#python-安装模式python_mode)）
+- **多平台**：同一标签同时提供 `linux/amd64` 与 `linux/arm64`
 - **阿里云源**：apt 和 npm 均使用国内镜像加速
 - **版本化配置**：通过 `versions.yml` 管理 DSH 及插件版本，支持组件名+版本号和直接 URL 两种安装方式
 - **Ansible 编排**：提供 Ansible Playbook 读取版本配置并自动部署
@@ -23,9 +25,9 @@
 │   ├── nodejs/                  # Node.js 24（预编译二进制）
 │   │   ├── bin/                 # node, npm, npx, pnpm
 │   │   └── lib/                 # 全局 npm 包
-│   └── python/                  # Python 3.14（源码编译）
-│       ├── bin/                 # python3, pip3
-│       ├── lib/                 # Python 标准库 + 共享库
+│   └── python/                  # Python（可选，PYTHON_MODE 控制）
+│       ├── bin/                 # python3, pip3      ← none 模式时不存在
+│       ├── lib/                 # 仅 source 模式：Python 标准库 + 共享库
 │       └── venv/                # Python 虚拟环境
 │
 ├── profile.env                  # 环境变量配置（可手动 source 生效）
@@ -83,10 +85,64 @@
 |------|------|----------|
 | Debian | 13 (trixie-slim) | 基础镜像 |
 | Node.js | 24.21.0 LTS | 预编译二进制绿色安装（按目标架构选择 x64 / arm64 包） |
-| Python | 3.14.7 | 源码编译绿色安装 |
+| Python | 3.13.5（apt）或 3.14.7（source） | **可选**，由 `PYTHON_MODE` 控制，见下节 |
 | Nginx | 1.26.3 | apt 安装，配置路径软链到 /dsh/ |
 | pnpm | 12.4.1 | npm tarball 手动绿色安装 |
 | DSH | 由 versions.yml 配置 | entrypoint.sh 动态安装 |
+
+### Python 安装模式（`PYTHON_MODE`）
+
+Python 是**可选组件**，由构建参数 `PYTHON_MODE` 控制，**默认 `apt`**。
+
+| 模式 | 版本 | 安装方式 | 镜像体积 | 构建耗时 |
+|------|------|---------|---------|---------|
+| `apt`（默认） | 3.13.5 | apt 装发行版自带 | 约 550 MB | 秒级 |
+| `source` | 3.14.7 | 源码编译到 `/dsh/app/python/` | 约 1.08 GB | amd64 约 4.5 分钟，arm64 在 QEMU 下显著更久 |
+| `none` | — | 不装 | 约 417 MB | — |
+
+> 体积为 `linux/amd64` 实测值（同条件下对比）。`source` 模式比 `apt` 多出约 530 MB，
+> 主要来自源码编译产物（头文件、静态库、`libpython3.14.so` 等）。
+
+**为什么默认用 apt**：Python 属备用工具链 —— DSH 本体与内置插件均为 Node.js 实现，
+运行时不依赖 Python（已核查 `script/*.sh`、`config/nginx/`、`versions.yml` 均无 Python 调用）。
+apt 安装系统自带版本无需编译、构建时间可忽略、镜像增量小；只有在**必须锁定特定 Python 版本**
+时才需要切到 `source` 模式编译。
+
+```bash
+# 默认：apt 装发行版自带 Python
+docker build -t dsh .
+
+# 源码编译指定版本（PYTHON_VERSION 可覆盖，默认 3.14.7）
+docker build --build-arg PYTHON_MODE=source -t dsh .
+
+# 完全不装
+docker build --build-arg PYTHON_MODE=none -t dsh .
+
+# 多平台构建同理
+docker buildx build --build-arg PYTHON_MODE=source --platform linux/amd64,linux/arm64 -t dsh .
+```
+
+CI 中默认值写在 `.github/workflows/docker-build.yml` 的 `env.PYTHON_MODE`（默认 `apt`）；
+也可在 Actions 页面手动触发 **Build DSH Docker Image** 工作流，用 `python_mode` 下拉项
+选择 `apt` / `source` / `none`，无需改代码。
+
+#### 目录结构对齐
+
+apt **无法**把 Python 装到 `/dsh` —— dpkg 包的安装路径在打包时就已固化，Debian 的
+Python 把 `/usr` 编译进了 `sys.prefix`（实测 `sys.prefix=/usr`），共享库位于
+`/usr/lib/<triplet>/`，整体重定位会直接破坏解释器。
+
+因此 apt 模式采用折中方案，让 `/dsh` 下的目录约定在两种模式下保持一致：
+
+| 路径 | apt 模式 | source 模式 |
+|------|---------|------------|
+| `/dsh/app/python/bin/python3` | 软链 → `/usr/bin/python3` | 真实文件（编译产物） |
+| `/dsh/app/python/bin/pip3` | 软链 → venv 内 pip | 软链 → venv 内 pip |
+| `/dsh/app/python/venv/` | venv（基于系统解释器） | venv（基于 3.14.7） |
+
+> 三种模式下 `PATH` 都保持干净：`profile.env` 与 `entrypoint.sh` 会先判断
+> `/dsh/app/python/bin/python3` 是否存在，存在才把 Python 路径追加进 `PATH`。
+> 构建结束时会自检模式与实际产物是否一致，不一致会直接构建失败。
 
 ### 支持的平台
 
