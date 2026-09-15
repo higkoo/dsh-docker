@@ -231,21 +231,66 @@ start_dsh() {
 }
 
 # ------------------------------------------------------------
-# 等待 DSH Web UI 就绪
-#   返回 0 = 就绪，1 = 超时
+# 等待 DSH 进入「可用」状态 —— 以日志行 + 进程存活为双重判据
+#
+# 为什么不再用「curl 端口 60 秒」：
+#   1) 端口通 ≠ DSH 活着。80/443 由 Nginx 监听，Nginx 一起来端口就通，
+#      哪怕后端 DSH 已经崩溃退出（v0.3.5 的 Python 插件崩溃就是这样：
+#      "DSH 已就绪 (等待 9s)" 紧跟着 "未检测到 token"，纯属假阳性）。
+#   2) 固定秒数不靠谱：内置插件要现场建 venv、装 marivo/pandas，
+#      首次启动 10~40s 都正常，等 9s 就判失败会误杀并触发无谓重启。
+#
+# 现在的判据（按优先级）：
+#   a) 日志出现 `dsh web:` 行  → 插件树已全部加载成功，**唯一可靠的就绪信号**
+#      （该行在 boot 成功后才会打印，含 token，直接可用）
+#   b) DSH 进程已退出          → 立即失败，无需干等到超时（崩溃能秒级暴露）
+#   c) 超过超时上限            → 仍未就绪，打印最近日志
+#
+# 超时上限同时给出「阶段化」进度提示，让用户知道此刻在干什么。
 # ------------------------------------------------------------
 wait_dsh_ready() {
     local label="${1:-DSH}"
-    local i
-    for i in $(seq 1 60); do
-        if curl -s "$DSH_HEALTH_URL" >/dev/null 2>&1; then
-            echo "  $label 已就绪 (等待 ${i}s)"
+    local waited=0
+    # 上限放宽到 120s：给插件首次建 venv / 装依赖留足时间，
+    # 由「进程死亡」和「日志成功行」两个信号来提前结束，而不是靠猜秒数。
+    local max_wait="${DSH_READY_TIMEOUT:-120}"
+    local next_hint=5
+    local alive
+
+    while [ "$waited" -lt "$max_wait" ]; do
+        # (a) 成功信号：日志里出现 dsh web: 行
+        if grep -qE 'dsh web: http' "$DSH_LOG" 2>/dev/null; then
+            echo "  ${label} 已就绪（${waited}s，插件树加载完成）"
             return 0
         fi
+
+        # (b) 失败信号：进程已退出，立刻失败，不必干等
+        alive=0
+        if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
+            alive=1
+        fi
+        if [ "$alive" -eq 0 ]; then
+            # 进程刚退出时日志可能还在刷，给它 1s 落盘再判定
+            sleep 1
+            if grep -qE 'dsh web: http' "$DSH_LOG" 2>/dev/null; then
+                echo "  ${label} 已就绪（${waited}s，插件树加载完成）"
+                return 0
+            fi
+            echo "  ${label} 进程已退出（${waited}s）—— 启动失败，非超时"
+            return 1
+        fi
+
+        # 阶段化进度：让用户知道还在等、等了多久
+        if [ "$waited" -ge "$next_hint" ]; then
+            echo "  ${label} 启动中... ${waited}s（插件初始化中，最长 ${max_wait}s）"
+            next_hint=$((next_hint + 10))
+        fi
+
         sleep 1
+        waited=$((waited + 1))
     done
-    echo "  $label 启动超时，请检查日志: $DSH_LOG"
-    cat "$DSH_LOG"
+
+    echo "  ${label} 启动超时（${max_wait}s 内未出现就绪日志）"
     return 1
 }
 
@@ -297,21 +342,35 @@ echo "  DSH Docker 容器"
 echo "  镜像版本: ${DSH_IMAGE_VERSION:-dev}"
 echo "  启动时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  根目录  : ${DSH_ROOT}"
+echo "  ---- 启动步骤 ----"
+echo "   [1/6] 检查/安装 DSH 及插件"
+echo "   [2/6] 生成自签 SSL 证书"
+echo "   [3/6] 启动 Nginx 反向代理 (80/443)"
+echo "   [4/6] 启动 DSH Web UI 并获取访问 token"
+echo "   [5/6] 输出访问地址"
+echo "   [6/6] 进入看护模式（前台）"
+echo "  提示: DSH 首次启动需初始化插件（可能 10~40s），就绪以日志出现"
+echo "        'dsh web:' 行为准，届时会打印访问地址。"
 echo "============================================================"
 
 # ============================================================
 # 1. 安装 DSH 及插件（如果尚未安装）
 # ============================================================
 if ! command -v dsh &>/dev/null; then
-    echo "============================================================"
-    echo "DSH 尚未安装，执行安装脚本..."
-    echo "============================================================"
+    echo "[1/6] DSH 尚未安装，执行安装脚本..."
     if ! bash "${DSH_ROOT}/script/install-dsh.sh"; then
-        echo "错误: DSH 安装脚本执行失败，请检查 ${DSH_LOG_DIR}/install.log"
+        echo "============================================================"
+        echo "  错误: DSH 安装脚本执行失败"
+        echo "  日志: ${DSH_LOG_DIR}/install.log"
+        echo "  ---- 最近 30 行 ----"
+        tail -n 30 "${DSH_LOG_DIR}/install.log" 2>/dev/null || true
+        echo "============================================================"
+        echo "  常见原因: 容器无法访问 npm registry（网络/代理/DNS）。"
+        echo "  容器将退出（exit 1）。"
         exit 1
     fi
 else
-    echo "DSH 已安装: $(dsh --version 2>&1)"
+    echo "[1/6] DSH 已安装: $(dsh --version 2>&1)"
 fi
 
 # 安装后再确认一次，避免 install-dsh.sh 静默失败导致后续 start_dsh 报 command not found
@@ -332,14 +391,14 @@ ensure_plugin "@chengxianglibra/dsh-data-analysis" "web" || true
 #    供 Nginx 443 HTTPS 使用
 # ============================================================
 if [ ! -f "${SSL_DIR}/dsh.crt" ]; then
-    echo "生成自签证书..."
+    echo "[2/6] 生成自签证书..."
     openssl req -x509 -newkey rsa:2048 -nodes \
         -keyout "${SSL_DIR}/dsh.key" \
         -out "${SSL_DIR}/dsh.crt" \
         -days 3650 \
         -subj "/C=CN/ST=Shanghai/L=Shanghai/O=Marivo/OU=DevOps/CN=higkoo" \
         -addext "subjectAltName=IP:0.0.0.0,DNS:*"
-    echo "自签证书已生成: ${SSL_DIR}/"
+    echo "      自签证书已生成: ${SSL_DIR}/"
 fi
 
 # ============================================================
@@ -348,7 +407,7 @@ fi
 #    因此不能靠 `&` + $! 取 PID（拿到的是已退出的父进程）。
 #    改为同步调用并检查退出码，PID 以 nginx 自己写入的 pid 文件为准。
 # ============================================================
-echo "启动 Nginx 反向代理 (port 80/443)..."
+echo "[3/6] 启动 Nginx 反向代理 (port 80/443)..."
 cleanup_stale_pid
 
 if ! nginx -c "${DSH_ROOT}/config/nginx/nginx.conf" 2>&1; then
@@ -396,49 +455,85 @@ fi
 
 # ============================================================
 # 4. 启动 DSH 并抓取访问 token
-#    插件在 dsh 启动时加载；以 dsh web 日志出现 "LAN:" 行作为
-#    dsh-web-lan-access 生效标志，未出现则自动重启重试，最多 3 轮。
 #
-#    实测（dsh-web-app 0.1.5-rc.1）：
-#      - 插件生效时日志为
-#          dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)
-#      - 插件把 webserver 绑定改成 0.0.0.0，因此 LAN 段才会出现；
-#        不带该插件时只有前半段，此时也不会重试（见下方判据）。
-#      - --no-open 只表示“不要自动开浏览器”，不影响该行输出，故保留。
+#    流程（单轮内完成，不再"先等端口、再另起一轮抓 token"）：
+#      启动 → 等待就绪（以日志出现 `dsh web:` 行为准）→ 直接从中提取 token
+#
+#    为什么只重启一次真正需要的情况：
+#      就绪信号本身就是「插件树全部加载成功」，一旦拿到该行，token 必然
+#      已经在同一行里，不存在"就绪了却没 token"的中间态。因此：
+#        - 成功 → 直接结束，绝不重启
+#        - 进程崩溃 → 重试（真正值得重试的情况，最多 MAX_ROUNDS 轮）
+#        - 超时但进程还活着 → 视为慢启动（插件在装依赖），只告警不重启
+#
+#    日志期望格式（dsh-web-app，含 LAN 插件时）：
+#      dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)
+#    LAN 段是 dsh-web-lan-access 插件把 webserver 绑定改成 0.0.0.0 后才出现的；
+#    不带该插件时只有前半段，此时依然算成功（不重试）。
+#    --no-open 只表示"不要自动开浏览器"，不影响该行输出，故保留。
 # ============================================================
-echo "启动 DSH Web UI..."
+echo "[4/6] 启动 DSH Web UI（首次启动需初始化插件，请耐心等待）..."
 TOKEN=""
 WEB_URL=""
 LAN_URL=""
-for round in 1 2 3; do
+MAX_ROUNDS=3
+
+for round in $(seq 1 "$MAX_ROUNDS"); do
+    [ "$round" -gt 1 ] && echo "--- 第 ${round}/${MAX_ROUNDS} 轮启动 ---"
     start_dsh
 
-    echo "等待 DSH 就绪 (第 ${round}/3 轮)..."
-    wait_dsh_ready "DSH" || exit 1
-
-    # 轮询提取 token（等待日志落盘；Node 写管道有缓冲，需给足时间）
-    for _ in $(seq 1 30); do
-        TOKEN="$(grep -oE 'token=[A-Za-z0-9_-]+' "$DSH_LOG" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
-        if [ -n "$TOKEN" ]; then break; fi
-        sleep 1
-    done
-
-    # LAN: 行是 dsh-web-lan-access 插件生效的标志（取最新一次启动的记录）
-    LAN_URL="$(grep -oE 'LAN: [^ )]+' "$DSH_LOG" 2>/dev/null | tail -1 | sed 's/LAN: //' || true)"
-
-    if [ -n "$LAN_URL" ]; then
-        echo "  LAN 插件已生效 (第 ${round} 轮): $LAN_URL"
-        break
+    if ! wait_dsh_ready "DSH"; then
+        # 就绪失败：区分「进程还活着（慢启动）」与「进程已死（真崩溃）」
+        if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
+            # 进程还活着，只是很慢（插件首次建 venv / 装依赖）。
+            # **不要 kill 重启** —— 那正是"无谓重启"的来源：
+            # 把正在初始化的插件打断，下一轮从零开始，反而更慢。
+            # 改为再等一个完整超时周期，给足时间。
+            echo "  DSH 进程仍在运行，只是尚未就绪 —— 再等一个周期（${DSH_READY_TIMEOUT:-120}s），不重启"
+            if wait_dsh_ready "DSH"; then
+                : # 已就绪，落到下方解析逻辑
+            else
+                echo "  进程存活但两个周期内仍未就绪，最近日志："
+                tail -n 20 "$DSH_LOG" 2>/dev/null || true
+                echo "  已放弃等待（进程仍在后台运行，容器继续看护）"
+                break
+            fi
+        else
+            # 进程已退出：这是真崩溃，值得重启重试
+            if [ "$round" -lt "$MAX_ROUNDS" ]; then
+                echo "  检测到 DSH 启动失败（进程已退出），自动重启重试（第 $((round+1))/${MAX_ROUNDS} 轮）..."
+                continue
+            fi
+            echo "  已重试 ${MAX_ROUNDS} 轮仍未成功，放弃。"
+            break
+        fi
     fi
 
-    # 已拿到 token 但没 LAN：说明插件没装/没生效，再重启也无益，
-    # 直接退出循环，避免空转两轮（各 30 秒）。
+    # 就绪即成功：token / URL 必然在同一行，直接解析
+    # 日志行形如：
+    #   dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)
+    # 下面统一以「dsh web: 」之后的内容为基准，避免把前缀带进 URL。
+    DSH_LINE="$(grep -oE 'dsh web: http[^ ]*' "$DSH_LOG" 2>/dev/null | tail -1 | sed 's/^dsh web: //' || true)"
+    TOKEN="$(printf '%s' "$DSH_LINE" | grep -oE 'token=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2 || true)"
+    WEB_URL="$(printf '%s' "$DSH_LINE" | sed -E 's/[?]token=[A-Za-z0-9_-]+//' || true)"
+    # LAN 段：从整行里取 LAN: 后面的 URL，去掉其 ?token= 参数
+    LAN_URL="$(grep -oE 'LAN: [^ )]+' "$DSH_LOG" 2>/dev/null | tail -1 \
+        | sed -E 's/^LAN: //; s/[?]token=[A-Za-z0-9_-]+//' || true)"
+
     if [ -n "$TOKEN" ]; then
-        echo "  已获取 token，但未检测到 LAN 地址（插件可能未生效），停止重试"
+        if [ -n "$LAN_URL" ]; then
+            echo "  LAN 插件已生效: $LAN_URL"
+        fi
         break
     fi
 
-    echo "  第 ${round} 轮未检测到 token，自动重启 DSH 重试..."
+    # 理论上不会到这里（就绪行必然含 token），保留兜底
+    echo "  警告: 已出现就绪行但未能解析出 token，原始行：$DSH_LINE"
+    if [ "$round" -lt "$MAX_ROUNDS" ]; then
+        echo "  重试中..."
+        continue
+    fi
+    break
 done
 
 # ============================================================
@@ -446,7 +541,7 @@ done
 # ============================================================
 if [ -n "$TOKEN" ]; then
     echo "============================================================"
-    echo "  DSH 已启动！请访问:"
+    echo "  [5/6] DSH 已就绪，请访问:"
     echo "    HTTP : http://<Your-IP>:${DSH_HTTP_PORT:-9080}/?token=${TOKEN}"
     echo "    HTTPS: https://<Your-IP>:${DSH_HTTPS_PORT:-9443}/?token=${TOKEN}"
     echo "  容器内直连: ${WEB_URL}"
@@ -456,8 +551,14 @@ if [ -n "$TOKEN" ]; then
     echo "  健康检查页面: http://<Your-IP>:${DSH_HTTP_PORT:-9080}/health"
     echo "============================================================"
 else
-    echo "  未抓到 token，请查看日志: $DSH_LOG"
-    cat "$DSH_LOG"
+    echo "============================================================"
+    echo "  错误: DSH 启动失败，未能获得访问 token"
+    echo "  日志: $DSH_LOG"
+    echo "  ---- 最近 40 行 ----"
+    tail -n 40 "$DSH_LOG" 2>/dev/null || true
+    echo "============================================================"
+    echo "  容器将退出（便于编排系统/用户感知失败，而不是假装 running）。"
+    exit 1
 fi
 
 # ============================================================
@@ -471,7 +572,7 @@ fi
 #      通配符在 tail 启动时展开；`tail -F` 会按文件名跟踪并自动处理轮转
 #      （文件被删除/重建后仍继续跟踪）。
 # ============================================================
-echo "开始跟踪日志 ($DSH_ROOT/log/*/*.log)..."
+echo "[6/6] 开始跟踪日志 ($DSH_ROOT/log/*/*.log)..."
 # nullglob：无匹配时数组为空，避免把字面量 "/dsh/log/*/*.log" 传给 tail
 shopt -s nullglob
 LOG_FILES=("${DSH_ROOT}"/log/*/*.log)
@@ -560,12 +661,19 @@ while true; do
     else
         if [ "$DSH_DOWN_SINCE" -eq 0 ]; then
             DSH_DOWN_SINCE=$(date +%s)
-            echo "  [watchdog] DSH 服务暂不可达，进入观察窗口（最长 ${DSH_DOWN_GRACE}s）..."
+            # 区分「进程还在、只是暂时不响应」与「进程已死、正在等交接」，
+            # 让观察窗口里的状态不再是一句含糊的"暂不可达"。
+            if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
+                echo "  [watchdog] DSH 进程仍在 (PID ${DSH_PID}) 但 HTTP 无响应，观察中（最长 ${DSH_DOWN_GRACE}s）..."
+            else
+                echo "  [watchdog] DSH 进程已退出，检测到外部重启（dsh-ctl）或崩溃，等待服务恢复（最长 ${DSH_DOWN_GRACE}s）..."
+            fi
         fi
         down_for=$(( $(date +%s) - DSH_DOWN_SINCE ))
         if [ "$down_for" -ge "$DSH_DOWN_GRACE" ]; then
             echo "  [watchdog] DSH 服务连续不可达 ${down_for}s（超过 ${DSH_DOWN_GRACE}s 宽限），判定为故障，容器即将退出"
-            tail -n 50 "$DSH_LOG" 2>/dev/null || true
+            echo "  ---- 最近 40 行日志 ----"
+            tail -n 40 "$DSH_LOG" 2>/dev/null || true
             exit 1
         fi
     fi
