@@ -37,8 +37,8 @@ if [ "$(readlink -f /etc/localtime 2>/dev/null)" != "/usr/share/zoneinfo/${TZ}" 
 fi
 
 # PATH 组装：nodejs 恒存在；python 路径仅在镜像确实装了 Python 时加入。
-# Python 由构建参数 PYTHON_MODE 控制（none 不装（默认）/ apt 装发行版自带
-# 版本 / source 源码编译指定版本）。
+# Python 由构建参数 PYTHON_MODE 控制（apt 装发行版自带（默认）/ source 源码
+# 编译指定版本 / none 不装，但 none 会让依赖 Python 的插件加载失败）。
 # 这里做存在性判断，避免 none 模式下 PATH 里残留指向空目录的条目
 # （虽不影响执行，但会让 `which python` 之类的排查产生误导）。
 DSH_PATH="${DSH_ROOT}/app/nodejs/bin"
@@ -46,6 +46,38 @@ if [ -x "${DSH_ROOT}/app/python/bin/python3" ]; then
     DSH_PATH="${DSH_PATH}:${DSH_ROOT}/app/python/bin:${DSH_ROOT}/app/python/venv/bin"
 fi
 export PATH="${DSH_PATH}:${PATH}"
+
+# ------------------------------------------------------------
+# 显式告知插件 Python 的位置（DSH_DATA_ANALYSIS_* 系列环境变量）
+#
+# 背景：内置插件 @chengxianglibra/dsh-data-analysis 的 cordis.patch.yml
+#   里这样声明配置：
+#     pythonExecutable:          !!js process.env.DSH_DATA_ANALYSIS_PYTHON
+#     bootstrapPythonExecutable: !!js process.env.DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON
+#   插件加载时会执行 `<bootstrap> -m venv <runtimeRoot>/.venv` 建**它自己的**
+#   托管运行时，再在其中安装 marivo/pandas，要求 Python >= 3.10 且带
+#   venv/ensurepip。
+#
+#   它默认靠 PATH 找 `python3`。本镜像虽已把 python 路径拼进 PATH，
+#   但若用户自行覆盖 PATH、或从其它 profile（如 dsh-ctl 进程外重启）
+#   拉起 DSH，`python3` 就可能不在搜索路径里 —— 插件随即抛
+#   "Could not validate local Python"，整棵插件树加载失败、DSH 起不来。
+#   这里把解释器**绝对路径**显式写进环境变量，插件无需再猜。
+#
+#   ⚠ 只设置 BOOTSTRAP，**不要**设置 PYTHON（pythonExecutable）：
+#     插件把 pythonExecutable 理解为「它自己托管运行时里的解释器」——
+#     validatedExisting() 会拿它和 record.pythonExecutable
+#     （即 <runtimeRoot>/.venv/bin/python）做严格相等比较，不一致就
+#     判定运行时失效、重新安装一遍。若我们指到 /dsh/app/python/venv，
+#     反而会让插件每次都重建自己的运行时。
+#     正确做法：只给"引导解释器"，让插件按自身设计创建/复用自己的 venv。
+# ------------------------------------------------------------
+if [ -x "${DSH_ROOT}/app/python/bin/python3" ]; then
+    export DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON="${DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON:-${DSH_ROOT}/app/python/bin/python3}"
+    echo "  Python 引导解释器: ${DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON}"
+else
+    echo "  警告: 未检测到 Python，依赖 Python 的插件将无法加载"
+fi
 
 DSH_LOG_DIR="${DSH_ROOT}/log/dsh"
 NGINX_LOG_DIR="${DSH_ROOT}/log/nginx"

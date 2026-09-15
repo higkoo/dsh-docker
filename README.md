@@ -6,7 +6,7 @@
 
 - **绿色安装**：所有组件（Node.js 24、Python 3.14、Nginx）安装在 `/dsh` 目录下，不污染系统
 - **软链接**：核心二进制软链接到 `/usr/local/bin`，全局可用
-- **可选组件**：Python 由构建参数 `PYTHON_MODE` 控制，**默认不装**（`none`），需要时切 apt 或用源码编译锁定版本（[详见](#python-安装模式python_mode)）
+- **Python 开箱可用**：默认装发行版自带 Python（`PYTHON_MODE=apt`），内置的数据分析插件开箱即用；需要锁版本时可切源码编译，也可用 `none` 极致瘦身（[详见](#python-安装模式python_mode)）
 - **多平台**：同一标签同时提供 `linux/amd64` 与 `linux/arm64`
 - **阿里云源**：apt 和 npm 均使用国内镜像加速
 - **版本化配置**：通过 `versions.yml` 管理 DSH 及插件版本，支持组件名+版本号和直接 URL 两种安装方式
@@ -25,7 +25,7 @@
 │   ├── nodejs/                  # Node.js 24（预编译二进制）
 │   │   ├── bin/                 # node, npm, npx, pnpm
 │   │   └── lib/                 # 全局 npm 包
-│   └── python/                  # Python（可选，PYTHON_MODE 控制）
+│   └── python/                  # Python（PYTHON_MODE 控制，默认 apt 安装）
 │       ├── bin/                 # python3, pip3      ← none 模式时不存在
 │       ├── lib/                 # 仅 source 模式：Python 标准库 + 共享库
 │       └── venv/                # Python 虚拟环境
@@ -85,46 +85,86 @@
 |------|------|----------|
 | Debian | 13 (trixie-slim) | 基础镜像 |
 | Node.js | 24.21.0 LTS | 预编译二进制绿色安装（按目标架构选择 x64 / arm64 包） |
-| Python | 3.13.5（apt）或 3.14.7（source） | **可选且默认不装**（`PYTHON_MODE=none`），见下节 |
+| Python | 3.13.5（apt，默认）或 3.14.7（source） | 由 `PYTHON_MODE` 控制，默认 apt；`none` 会禁用 Python 插件，见下节 |
 | Nginx | 1.26.3 | apt 安装，配置路径软链到 /dsh/ |
 | pnpm | 12.4.1 | npm tarball 手动绿色安装 |
 | DSH | 由 versions.yml 配置 | entrypoint.sh 动态安装 |
 
 ### Python 安装模式（`PYTHON_MODE`）
 
-Python 是**可选组件**，由构建参数 `PYTHON_MODE` 控制，**默认 `none`（不装）**。
+Python 由构建参数 `PYTHON_MODE` 控制，**默认 `apt`**。
 
 | 模式 | 版本 | 安装方式 | 镜像体积 | 构建耗时 |
 |------|------|---------|---------|---------|
-| `none`（默认） | — | 不装 | 约 417 MB | — |
-| `apt` | 3.13.5 | apt 装发行版自带 | 约 550 MB | 秒级 |
+| `apt`（默认） | 3.13.5 | apt 装发行版自带 | 约 550 MB | 秒级 |
 | `source` | 3.14.7 | 源码编译到 `/dsh/app/python/` | 约 1.08 GB | amd64 约 4.5 分钟，arm64 在 QEMU 下显著更久 |
+| `none` | — | 不装 | 约 417 MB | — |
 
 > 体积为 `linux/amd64` 实测值（同条件下对比）。`source` 模式比 `apt` 多出约 530 MB，
 > 主要来自源码编译产物（头文件、静态库、`libpython3.14.so` 等）。
 
-**为什么默认不装**：Python 属备用工具链 —— DSH 本体与内置插件均为 Node.js 实现，
-运行时不依赖 Python（已核查 `script/*.sh`、`config/nginx/`、`versions.yml` 均无 Python 调用）。
-默认不装可以让镜像最小、构建最快，把 CI 时间集中在功能验证上；后续确有需要时，
-再用 `apt`（省事）或 `source`（锁版本）重新构建即可，无需改动其它配置。
+**为什么默认装 Python（而不是 `none`）**：内置插件
+`@chengxianglibra/dsh-data-analysis`（Web profile 的数据分析能力）**强依赖本地 Python** ——
+插件加载时会执行 `python3 -m venv` 建运行时，再在其中安装 `marivo`/`pandas`，
+要求 **Python ≥ 3.10 且带 `venv`/`ensurepip`**。
+
+若镜像里没有 Python，该插件 `apply()` 会抛 `MarivoEnvironmentError`，导致 cordis **整棵插件树
+加载失败**，DSH 进程随即退出 —— 现象就是「服务起不来、拿不到 token、日志里全是 Node 崩溃栈」：
+
+```
+Error: dsh: plugin tree failed to load: failed to apply loader entry dsh-data-analysis
+(@chengxianglibra/dsh-data-analysis): Could not validate local Python.
+Install Python 3.10+ with venv/ensurepip, or set bootstrapPythonExecutable to its absolute path.
+  code: 'shared-runtime-install-failed'
+```
+
+DSH **本体**确实不依赖 Python，但**这个内置插件依赖**，因此默认必须带上。
+只有在明确不需要数据分析功能、且愿意放弃该插件时，才用 `none` 极致瘦身。
 
 ```bash
-# 默认：完全不装 Python
+# 默认：apt 装发行版自带 Python
 docker build -t dsh .
 
-# 需要时用 apt 装发行版自带 Python
-docker build --build-arg PYTHON_MODE=apt -t dsh .
-
-# 或源码编译指定版本（PYTHON_VERSION 可覆盖，默认 3.14.7）
+# 源码编译指定版本（PYTHON_VERSION 可覆盖，默认 3.14.7）
 docker build --build-arg PYTHON_MODE=source -t dsh .
+
+# 完全不装（注意：会让 dsh-data-analysis 插件加载失败）
+docker build --build-arg PYTHON_MODE=none -t dsh .
 
 # 多平台构建同理
 docker buildx build --build-arg PYTHON_MODE=source --platform linux/amd64,linux/arm64 -t dsh .
 ```
 
-CI 中默认值写在 `.github/workflows/docker-build.yml` 的 `env.PYTHON_MODE`（默认 `none`）；
+CI 中默认值写在 `.github/workflows/docker-build.yml` 的 `env.PYTHON_MODE`（默认 `apt`）；
 也可在 Actions 页面手动触发 **Build DSH Docker Image** 工作流，用 `python_mode` 下拉项
-选择 `none` / `apt` / `source`，无需改代码。
+选择 `apt` / `source` / `none`，无需改代码。
+
+#### 插件如何找到 Python（`DSH_DATA_ANALYSIS_*` 环境变量）
+
+`dsh-data-analysis` 插件按 「插件 `config` → 环境变量 → 默认值」 的顺序定位解释器。
+它**不使用镜像里的 `/dsh/app/python/venv`**，而是用自己的**托管运行时**：
+用引导解释器执行 `python3 -m venv <runtimeRoot>/.venv`，再在其中安装 `marivo`/`pandas`。
+
+容器启动时 `entrypoint.sh` / `profile.env` 会自动导出引导解释器的绝对路径，
+插件无需依赖 `PATH` 搜索：
+
+| 环境变量 | 本镜像是否设置 | 用途 |
+|---------|--------------|------|
+| `DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON` | **是** → `/dsh/app/python/bin/python3` | 引导解释器，插件用它创建托管 venv |
+| `DSH_DATA_ANALYSIS_PYTHON` | 否（刻意留空） | 指向插件**托管运行时内**的解释器；设错会让插件重建运行时 |
+| `DSH_DATA_ANALYSIS_RUNTIME_ROOT` | 否 | 自定义托管运行时根目录（一般不用设） |
+| `DSH_DATA_ANALYSIS_PROJECT_ROOT` | 否 | 自定义项目根目录（一般不用设） |
+
+> **为什么只设 `BOOTSTRAP_PYTHON`**：插件在校验已有运行时时，会把
+> `pythonExecutable` 与它自己记录的 `<runtimeRoot>/.venv/bin/python` 做**严格相等**比较。
+> 若我们把它指到 `/dsh/app/python/venv`，校验必然不通过，插件每次启动都会**重建**自己的运行时。
+> 因此只提供「引导解释器」，让插件按自身设计创建/复用其 venv。
+>
+> 该变量只在镜像确实装了 Python 时才导出（`none` 模式不设置）。
+> 显式导出是为了兜底 `PATH` 被覆盖、或 `dsh-ctl` 从进程外拉起 DSH 等场景。
+> 如需自定义，在 `docker run -e` 或 `/dsh/profile.env` 中覆盖即可 ——
+> 脚本使用 `${VAR:-默认值}`，已存在的值不会被覆盖。
+
 
 #### 目录结构对齐
 
@@ -195,7 +235,7 @@ source /dsh/profile.env
 
 ```bash
 # 方式一：临时覆盖（推荐）
-docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.5
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.6
 
 # 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
 ```
@@ -274,14 +314,14 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
 | 标签 | 含义 | 适用场景 |
 |------|------|----------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.3.5` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
+| `v0.3.6` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
 | `v0.3` | 次版本浮动标签，随补丁自动更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
 
 > 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
 > 版本号标签、`X.Y` 浮动标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
 
-**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.5` 及以上版本。
+**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.6` 及以上版本。
 
 > 容器默认使用**北京时间（`Asia/Shanghai`）**，日志与 `date` 均为东八区时间。
 > 详细说明与修改方式见上文「[时区说明](#时区说明)」。
@@ -371,11 +411,11 @@ bash test/test_versions_parser.sh
 ### 发布新版本
 
 ```bash
-git tag -a v0.3.5 -m "v0.3.5: 变更说明"
-git push origin v0.3.5
+git tag -a v0.3.6 -m "v0.3.6: 变更说明"
+git push origin v0.3.6
 ```
 
-推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.5`、`v0.3`、`latest` 与 `sha-*` 标签。
+推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.6`、`v0.3`、`latest` 与 `sha-*` 标签。
 
 ## License
 

@@ -9,13 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       python_mode:
-        description: "Python 安装模式：none（默认，不装）/ apt（发行版自带 3.13）/ source（源码编译 3.14）"
+        description: "Python 安装模式：apt（默认，发行版自带 3.13）/ source（源码编译 3.14）/ none（不装，会禁用 Python 插件）"
         type: choice
         options:
-          - none
           - apt
           - source
-        default: none
+          - none
+        default: apt
 
 permissions:
   packages: write
@@ -27,16 +27,18 @@ env:
   #   v1.2.3  -> v1.2.3
   #   分支推送 -> 空（仅 latest + sha 标签）
   VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-  # Python 安装模式（默认 none）
+  # Python 安装模式（默认 apt）
   # ------------------------------------------------------------
-  #   none   完全不装（默认）—— 镜像最小、构建最快
-  #   apt    用 apt 装 Debian 发行版自带的 Python（约 3.13.5）
+  #   apt    用 apt 装 Debian 发行版自带的 Python（约 3.13.5，默认）
   #          —— 秒级安装、体积小（stdlib 约 27MB）
   #   source 源码编译指定版本（3.14.7），耗时且体积大，
   #          在 buildx 的 QEMU 环境下编译 arm64 尤其慢
-  # DSH 本体与内置插件均为 Node.js 实现，运行时不依赖 Python，
-  # 因此默认不装，把构建时间留给功能验证；后续确有需要再开启。
-  PYTHON_MODE: ${{ inputs.python_mode || 'none' }}
+  #   none   完全不装 —— 镜像最小，但会让依赖 Python 的内置插件
+  #          (@chengxianglibra/dsh-data-analysis) 加载失败，
+  #          进而拖垮整棵 cordis 插件树、DSH 起不来。
+  # 内置插件 dsh-data-analysis 强依赖本地 Python >=3.10（需 venv/ensurepip），
+  # 因此默认必须装；仅当明确不需要数据分析功能时才手动切 none。
+  PYTHON_MODE: ${{ inputs.python_mode || 'apt' }}
   # OCI 描述文案：Dockerfile 的 LABEL 与 CI 的 index 注解共用同一来源，
   # 避免两处各写一份导致不一致
   IMAGE_DESCRIPTION: "DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"

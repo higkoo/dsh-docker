@@ -60,19 +60,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2.1 构建选项：Python 安装模式（PYTHON_MODE）
 # ------------------------------------------------------------
 # 三态取值：
-#   none   （默认）完全不安装 Python
-#          —— 镜像最小（约 417MB）、构建最快。DSH 本体与内置插件
-#             均为 Node.js 实现，运行时不依赖 Python，因此默认关闭。
-#   apt    用 apt 安装 Debian 发行版自带的 Python（约 3.13.5）
+#   apt    （默认）用 apt 安装 Debian 发行版自带的 Python（约 3.13.5）
 #          —— 秒级安装、体积小（stdlib 约 27MB）、与系统库版本天然匹配
 #   source 源码编译安装指定版本（PYTHON_VERSION，默认 3.14.7）
 #          —— 版本可控，但编译耗时长（arm64 在 QEMU 下尤甚）、体积大
+#   none   完全不安装 Python
+#          —— 镜像最小（约 417MB）、构建最快。**但会让依赖 Python 的
+#             插件加载失败**（见下方"为什么默认 apt"），仅用于明确不需要
+#             数据分析类功能的场景。
 #
-# 为什么默认 none：
-#   DSH 本体与内置插件均为 Node.js 实现，运行时不依赖 Python
-#   （已核查 script/*.sh、config/nginx/、versions.yml 均无 Python 调用），
-#   Python 属于"备用工具链"。默认不装可让镜像更小、构建更快，
-#   把 CI 时间花在功能验证上；后续确有需要再切 apt 或 source 开启。
+# 为什么默认 apt（而不是 none）：
+#   内置插件 @chengxianglibra/dsh-data-analysis 在加载时**强依赖本地
+#   Python**：它要执行 `python3 -m venv` 并在其中安装 marivo/pandas，
+#   要求 Python >= 3.10 且带 venv/ensurepip。若镜像里没有 Python，
+#   该插件 apply() 会抛 MarivoEnvironmentError，cordis 插件树随之整体
+#   加载失败，DSH 进程直接退出 —— 表现就是「服务起不来、拿不到 token」。
+#   （实测日志：`dsh: plugin tree failed to load: failed to apply loader
+#    entry to dsh-data-analysis ... Could not validate local Python`）
+#   因此默认必须带上 Python；确需极致瘦身且愿意放弃该插件时，才用 none。
 #
 # 关于「apt 能否装到 /dsh 目录」：
 #   不能。dpkg 包的安装路径在打包时就已固化，Debian 的 Python 解释器
@@ -86,11 +91,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   上层脚本与 PATH 判断逻辑无需区分模式。
 #
 # 用法：
-#   docker build .                                          # none（默认）
-#   docker build --build-arg PYTHON_MODE=apt .              # apt 安装
+#   docker build .                                          # apt（默认）
 #   docker build --build-arg PYTHON_MODE=source .           # 源码编译
+#   docker build --build-arg PYTHON_MODE=none .             # 不装（放弃 Python 插件）
 # ============================================================
-ARG PYTHON_MODE=none
+ARG PYTHON_MODE=apt
 
 # ============================================================
 # 3. 创建 /dsh 绿色安装目录结构
