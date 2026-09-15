@@ -85,12 +85,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-          # 标签优先级决定 org.opencontainers.image.version 的取值：
-          # 高优先级的标签会胜出，因此 semver 必须排在 raw=latest 之前，
-          # 否则推 tag 构建时 version 会被写成 "latest"（而非 vX.Y.Z）。
+          # 标签命名保持 `v` 前缀（与既有 v0.2.4 / v0.3.0 一致）：
+          # type=semver 默认会剥掉 `v`，必须用 pattern 显式补回，
+          # 否则会产出 `0.3.1` / `0.3` 而非 `v0.3.1` / `v0.3`。
+          # 优先级决定 org.opencontainers.image.version 的取值：
+          # semver 必须高于 raw=latest，否则推 tag 时 version 会被写成 "latest"。
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
             type=raw,value=latest,priority=600
             type=sha,format=short,priority=200
           # 注意：metadata-action 会自动从仓库元数据派生
@@ -108,16 +110,17 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          # 多平台构建：amd64 + arm64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # ============================================================
           # OCI 注解必须用 `annotation-index.` 前缀
           # ------------------------------------------------------------
-          # buildx 会为镜像产出 OCI image index（即 manifest list，
-          # 包含平台 manifest + attestation 证明层）。
-          # GHCR 的 package 页面读取的是 **index 层的 annotations**，
-          # 而不是 image config 里的 label。
+          # buildx 产出的是 OCI image index（manifest list，含各平台
+          # manifest + attestation 证明层）。GHCR package 页面读取的是
+          # **index 层的 annotations**，而不是 image config 里的 label。
           # 若用 `annotation.`（写入内层 manifest），index 层仍为空，
           # 页面就会显示 "No description provided"。
           # 已实测验证：annotation. → index 注解为空；annotation-index. → 正常写入。

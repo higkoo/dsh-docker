@@ -82,11 +82,30 @@
 | 组件 | 版本 | 安装方式 |
 |------|------|----------|
 | Debian | 13 (trixie-slim) | 基础镜像 |
-| Node.js | 24.21.0 LTS | 预编译二进制绿色安装 |
+| Node.js | 24.21.0 LTS | 预编译二进制绿色安装（按目标架构选择 x64 / arm64 包） |
 | Python | 3.14.7 | 源码编译绿色安装 |
 | Nginx | 1.26.3 | apt 安装，配置路径软链到 /dsh/ |
 | pnpm | 12.4.1 | npm tarball 手动绿色安装 |
 | DSH | 由 versions.yml 配置 | entrypoint.sh 动态安装 |
+
+### 支持的平台
+
+镜像为**多平台构建**，同一标签下同时提供两种架构，Docker 会自动选择匹配当前主机的版本：
+
+| 平台 | 说明 |
+|------|------|
+| `linux/amd64` | x86-64 服务器 / 常规云主机 |
+| `linux/arm64` | ARM64 服务器、Apple Silicon（M 系列）Mac |
+
+> 构建时 Dockerfile 通过 `TARGETARCH` 自动映射 Node.js 的架构命名
+> （`amd64` → `x64`、`arm64` → `arm64`），Python 为源码编译、Nginx 走 apt，
+> 二者天然支持上述架构。其它架构（如 `386`、`riscv64`）不受支持，构建会显式报错。
+
+指定平台拉取（一般无需手动指定）：
+
+```bash
+docker pull --platform linux/arm64 ghcr.io/higkoo/dsh:latest
+```
 
 ## 环境变量
 
@@ -120,7 +139,7 @@ source /dsh/profile.env
 
 ```bash
 # 方式一：临时覆盖（推荐）
-docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.4.0
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.1
 
 # 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
 ```
@@ -199,14 +218,14 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
 | 标签 | 含义 | 适用场景 |
 |------|------|----------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.4.0` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
-| `0.4` | 次版本浮动标签，随补丁自动更新 | 跟随次版本线 |
+| `v0.3.1` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
+| `v0.3` | 次版本浮动标签，随补丁自动更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
 
 > 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
 > 版本号标签、`X.Y` 浮动标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
 
-**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.4.0` 及以上版本。
+**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.1` 及以上版本。
 
 > 容器默认使用**北京时间（`Asia/Shanghai`）**，日志与 `date` 均为东八区时间。
 > 详细说明与修改方式见上文「[时区说明](#时区说明)」。
@@ -296,11 +315,11 @@ bash test/test_versions_parser.sh
 ### 发布新版本
 
 ```bash
-git tag -a v0.4.0 -m "v0.4.0: 变更说明"
-git push origin v0.4.0
+git tag -a v0.3.1 -m "v0.3.1: 变更说明"
+git push origin v0.3.1
 ```
 
-推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.4.0`、`0.4`、`latest` 与 `sha-*` 标签。
+推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.1`、`v0.3`、`latest` 与 `sha-*` 标签。
 
 ## License
 

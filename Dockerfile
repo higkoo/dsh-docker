@@ -69,11 +69,24 @@ RUN mkdir -p \
 
 # ============================================================
 # 4. Node.js 24 绿色安装（预编译二进制，解压到 /dsh/app/nodejs/）
+#    多架构支持：按 TARGETARCH 选择对应的预编译包
+#      amd64 -> x64
+#      arm64 -> arm64
+#    Node 官方的架构命名与 OCI 的 TARGETARCH 并不一致（x64 vs amd64），
+#    因此必须显式映射，不能直接拼 $TARGETARCH。
 # ============================================================
 ARG NODE_VERSION=24.21.0
-RUN curl -fsSL "https://npmmirror.com/mirrors/node/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in \
+        amd64) NODE_ARCH=x64   ;; \
+        arm64) NODE_ARCH=arm64 ;; \
+        *) echo "不支持的架构: ${TARGETARCH}（仅支持 amd64 / arm64）" >&2; exit 1 ;; \
+    esac \
+    && echo "目标架构: ${TARGETARCH} -> Node 架构: ${NODE_ARCH}" \
+    && curl -fsSL "https://npmmirror.com/mirrors/node/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
         | tar -xJ -C /dsh/app/nodejs --strip-components=1 \
-    && echo "Node.js ${NODE_VERSION} installed to /dsh/app/nodejs/"
+    && echo "Node.js ${NODE_VERSION} (${NODE_ARCH}) installed to /dsh/app/nodejs/" \
+    && /dsh/app/nodejs/bin/node -e "console.log('node ok:', process.version, process.arch)"
 
 # ============================================================
 # 5. Python 3.14 绿色安装（源码编译，安装到 /dsh/app/python/）
