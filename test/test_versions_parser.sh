@@ -77,9 +77,10 @@ P1="$(sed -n '/^PLUGINS_START$/,/^PLUGINS_END$/p' /tmp/_c1 | sed '1d;$d')"
 
 assert_eq "dsh 版本剥离行内注释 => latest" "latest" "$V1"
 assert_eq "dsh url（注释掉的行）应为空" "" "$U1"
-assert_eq "插件行数应为 2" "2" "$(printf '%s' "$P1" | grep -c .)"
+assert_eq "插件行数应为 3" "3" "$(printf '%s' "$P1" | grep -c .)"
 assert_eq "插件1 完整字段" "dsh-web-lan-access|latest||web" "$(printf '%s\n' "$P1" | sed -n '1p')"
 assert_eq "插件2 完整字段" "dsh-ctl|latest||web" "$(printf '%s\n' "$P1" | sed -n '2p')"
+assert_eq "插件3 完整字段（scope 包名含 @ 与 /）" "@chengxianglibra/dsh-data-analysis|latest||web" "$(printf '%s\n' "$P1" | sed -n '3p')"
 echo
 
 # ---------- 用例2: 启用 URL 安装方式 ----------
@@ -202,7 +203,7 @@ SETE_RC=$?
 assert_eq "set -e 下脚本正常退出（退出码 0）" "0" "$SETE_RC"
 assert_eq "解析后打印 PARSE_OK" "1" "$(printf '%s' "$SETE_OUT" | grep -c 'PARSE_OK')"
 assert_eq "主流程执行到 ALL_DONE（不再中途退出）" "1" "$(printf '%s' "$SETE_OUT" | grep -c 'ALL_DONE')"
-assert_eq "插件列表打印 2 条" "2" "$(printf '%s' "$SETE_OUT" | grep -c '^LIST ')"
+assert_eq "插件列表打印 3 条" "3" "$(printf '%s' "$SETE_OUT" | grep -c '^LIST ')"
 echo
 
 # ---------- 用例10: read 到 EOF 不得被 set -e 中断 ----------

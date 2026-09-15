@@ -189,7 +189,14 @@ install_plugin() {
     local url="$3"
     local profile="$4"
 
-    local plugin_log="${PLUGIN_LOG_DIR}/${name}.log"
+    # 日志文件名需做安全化处理：npm scope 包名形如 @scope/pkg，
+    # 直接拼接会得到 `.../@scope/pkg.log`，即把 scope 当成子目录，
+    # 而该目录并不存在 —— tee 写入失败在 set -o pipefail 下会让整条
+    # 管道返回非零，安装被误判为失败并重试 3 次后中断构建。
+    # 因此把路径分隔符等不安全字符统一替换为 `__`。
+    local log_name="${name//[^A-Za-z0-9._-]/__}"
+    local plugin_log="${PLUGIN_LOG_DIR}/${log_name}.log"
+    mkdir -p "$PLUGIN_LOG_DIR"
     echo "------------------------------------------------------------"
     echo "安装插件: $name"
     echo "  版本: ${version:-未指定}"

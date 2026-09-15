@@ -231,6 +231,9 @@ fi
 # 关键：验证插件已注册（profiles/web 目录存在 ≠ 注册成功，以 plugin list 为准）
 ensure_plugin "dsh-web-lan-access" "web" || true
 ensure_plugin "dsh-ctl" "web" || true
+# 数据分析插件为 npm scope 包名（@scope/name），此处必须写完整包名；
+# plugin_registered 的词边界匹配已兼容包名中的 '/'。
+ensure_plugin "@chengxianglibra/dsh-data-analysis" "web" || true
 
 # ============================================================
 # 2. 生成自签 SSL 证书（仅在证书不存在时生成）

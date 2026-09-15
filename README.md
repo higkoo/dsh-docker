@@ -54,7 +54,8 @@
 │   └── plugins/                 # 插件日志
 │       ├── dsh-web-lan-access.log
 │       ├── dsh-ctl.log
-│       └── dsh-ctl-relaunch.log # ctl 重启 DSH 的接力日志（含重启后的新 token）
+│       ├── dsh-ctl-relaunch.log # ctl 重启 DSH 的接力日志（含重启后的新 token）
+│       └── __chengxianglibra__dsh-data-analysis.log  # 数据分析插件（包名 '/' 已安全化）
 │
 ├── run/                         # 运行时目录
 │   ├── nginx.pid                # Nginx PID（由 nginx 自身写入）
@@ -153,6 +154,21 @@ plugins:
 
 > 插件安装在 `install-dsh.sh` / `entrypoint.sh` 中均**以 `dsh plugin list` 的实际结果为准**，
 > 而非命令退出码；未注册会自动重试最多 3 次。安装日志见 `/dsh/log/plugins/<插件名>.log`。
+>
+> **npm scope 包名**：插件名需写完整包名（如 `@chengxianglibra/dsh-data-analysis`），
+> 不可省略 `@scope/` 前缀。日志文件名会把包名中的 `/` 等字符安全化为 `__`，
+> 因此该插件的日志为 `/dsh/log/plugins/__chengxianglibra__dsh-data-analysis.log`。
+
+### 内置插件列表
+
+| 插件 | 包名 | 说明 |
+|------|------|------|
+| `dsh-web-lan-access` | `dsh-web-lan-access` | 局域网访问支持 |
+| `dsh-ctl` | `dsh-ctl` | 进程控制与计划内重启，重启日志写入 `/dsh/log/plugins/dsh-ctl-relaunch.log` |
+| 数据分析 | `@chengxianglibra/dsh-data-analysis` | 基于 Marivo 的数据分析插件：自然语言分析指标趋势、连接数据源、生成图表／报告／看板，支持导出 HTML 离线阅读 |
+
+> 数据分析插件为社区插件（非 DeepSeek 官方发行），首次使用会自动准备分析环境并联网下载依赖。
+> 要求 DSH `>=0.1.5-rc.1`；镜像内置 Node.js 24 满足其 `^22.19.0 || >=24.0.0` 要求。
 
 ## Nginx 配置
 
