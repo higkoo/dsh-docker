@@ -153,6 +153,11 @@ sync_dsh_log_alias() {
 # DSH 启动次数计数器，仅用于日志分隔标记（便于区分多轮重试）
 DSH_START_COUNT=0
 
+# [4/6] 启动期的日志实时转发进程 PID（tail -F | sed 管道的作业号）。
+# 用于在 [6/6] 之前停掉它，改由整合 tail 统一输出，避免重复。
+DSH_FOLLOW_PID=""
+DSH_PID=""
+
 # 启动前自检：确认日志文件确实可写。若不可写则直接报错退出，
 # 避免重演「默默写不进去、事后才发现」的排查困境。
 prepare_log_file() {
@@ -207,11 +212,13 @@ start_dsh() {
     sync_dsh_log_alias
 
     # 写入带时间戳的分隔标记：多轮重试（最多 3 轮）时能一眼区分第几次启动。
+    #
+    # 注意：这里**只写文件、不直接 echo**。若同时也 echo，会与下面 tail 转发
+    # 产生的同一行重复输出（标记行刚写进文件就被 tail 读出来打印）。
+    # 终端上照样能看到它 —— 因为 tail 转发会带上 `[dsh]` 前缀输出。
     if [ -w "$DSH_LOG" ]; then
         DSH_START_COUNT=$((DSH_START_COUNT + 1))
-        {
-            echo "----- dsh web 启动 #${DSH_START_COUNT} @ $(date '+%Y-%m-%d %H:%M:%S') -----"
-        } >> "$DSH_LOG"
+        echo "----- dsh web 启动 #${DSH_START_COUNT} @ $(date '+%Y-%m-%d %H:%M:%S') -----" >> "$DSH_LOG"
     fi
 
     # 保留 --no-open：它只表示「不要自动打开浏览器」，不影响启动日志里的
@@ -223,41 +230,92 @@ start_dsh() {
     # 里把 webserver 绑定覆写为 0.0.0.0（这正是 LAN 段能出现的前提），
     # 脚本不必也不应再干预监听参数。
     #
-    # 日志：直接追加重定向到文件（不再走 FIFO + tee，理由见文件头部说明）。
+    # 日志：先落到文件（保留完整记录），再由后台 tail 实时转发到容器终端。
+    #
+    # 为什么要在启动阶段就转发：
+    #   DSH 初始化插件是**正常的慢过程**（dsh-data-analysis 首次要建 venv、
+    #   装 marivo/pandas，1~3 分钟）。这段时间如果终端一片空白，用户会以为
+    #   卡死了，进而做无谓的重启/改动。所以启动期就把 dsh 自己的日志实时打出来，
+    #   让人看到「正在加载 xx 插件」这类进度。主流程另有每 10s 的等待心跳，
+    #   两者配合，终端始终有内容。
+    #
+    # 为什么用 `tail -F` 转发而不是直接 `tee`：
+    #   1) 文件里必须是**原始日志**（不含 [dsh] 前缀），否则主流程解析
+    #      `dsh web: http...` 那行会被前缀污染；
+    #   2) `tail -F` 不占管道、不阻塞写入，dsh 退出后 tail 自然结束；
+    #   3) 与 [6/6] 阶段统一用 tail -F 转发，逻辑一致。
+    #
+    # 关键：必须先创建文件再 `tail -F`，否则某些环境会先报
+    #   "cannot open ... for reading: No such file or directory"。
     # 这里显式声明 2>&1，确保 stderr 也不会漏。
+    touch "$DSH_LOG" 2>/dev/null || true
     dsh web --no-open >> "$DSH_LOG" 2>&1 &
+
+    # 实时转发启动日志（带 [dsh] 前缀）。统一经 stop_dsh_log_follow 停掉，
+    # 避免与 [6/6] 的全量 tail 重复输出。
+    if [ -n "$DSH_FOLLOW_PID" ] && kill -0 "$DSH_FOLLOW_PID" 2>/dev/null; then
+        kill "$DSH_FOLLOW_PID" 2>/dev/null || true
+    fi
+    tail -F -n +1 "$DSH_LOG" 2>/dev/null | sed -u 's/^/  [dsh] /' | grep --line-buffered '' &
+    DSH_FOLLOW_PID=$!
+
     DSH_PID=$!
     echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 }
 
 # ------------------------------------------------------------
+# 停止 [4/6] 阶段的日志实时转发。
+# 由 [6/6] 的整合 tail（覆盖 /dsh/log/*/*.log）接手继续输出，
+# 这样既保证启动期有进度可见，又不会在稳态下重复打印同一份日志。
+# ------------------------------------------------------------
+stop_dsh_log_follow() {
+    if [ -n "$DSH_FOLLOW_PID" ] && kill -0 "$DSH_FOLLOW_PID" 2>/dev/null; then
+        # 先 kill 管道尾端的 grep，再 kill tail；两者都在同一进程组内，
+        # 逐个 kill 才能确保管道被彻底拆掉、不留僵尸。
+        pkill -P "$DSH_FOLLOW_PID" 2>/dev/null || true
+        kill "$DSH_FOLLOW_PID" 2>/dev/null || true
+        wait "$DSH_FOLLOW_PID" 2>/dev/null || true
+    fi
+    DSH_FOLLOW_PID=""
+}
+
+# ------------------------------------------------------------
 # 等待 DSH 进入「可用」状态 —— 以日志行 + 进程存活为双重判据
 #
-# 为什么不再用「curl 端口 60 秒」：
+# 为什么不用「curl 端口 + 固定秒数」：
 #   1) 端口通 ≠ DSH 活着。80/443 由 Nginx 监听，Nginx 一起来端口就通，
-#      哪怕后端 DSH 已经崩溃退出（v0.3.5 的 Python 插件崩溃就是这样：
-#      "DSH 已就绪 (等待 9s)" 紧跟着 "未检测到 token"，纯属假阳性）。
-#   2) 固定秒数不靠谱：内置插件要现场建 venv、装 marivo/pandas，
-#      首次启动 10~40s 都正常，等 9s 就判失败会误杀并触发无谓重启。
+#      哪怕后端 DSH 已经崩溃退出 —— 「已就绪」是假阳性。
+#   2) 固定秒数不靠谱，且**前后都错**：
+#      - 等太短（旧版 9s）：插件首次建 venv、装 marivo/pandas 要 1~3 分钟，
+#        9s 判失败是误杀，还会触发无谓重启；
+#      - 等太久也没意义：卡死的进程不该靠"多等"来救。
 #
-# 现在的判据（按优先级）：
-#   a) 日志出现 `dsh web:` 行  → 插件树已全部加载成功，**唯一可靠的就绪信号**
-#      （该行在 boot 成功后才会打印，含 token，直接可用）
-#   b) DSH 进程已退出          → 立即失败，无需干等到超时（崩溃能秒级暴露）
-#   c) 超过超时上限            → 仍未就绪，打印最近日志
+# 正确的判据是**事件**而非**时长**：
+#   a) 日志出现 `dsh web:` 行  → 插件树全部加载成功，唯一可靠的就绪信号
+#      （该行在 boot 成功后才会打印，且天然携带 token）
+#   b) DSH 进程已退出          → 真崩溃，立即失败（无需干等到超时）
+#   c) 进程存活但长时间无进展  → 打印诊断信息后继续等（**不判失败**）
 #
-# 超时上限同时给出「阶段化」进度提示，让用户知道此刻在干什么。
+# 关键设计：**只要进程还活着，就认定"仍在初始化"并继续等待**。
+#   慢 ≠ 坏。插件首次安装依赖可能耗时数分钟，这是正常的；
+#   把健康但慢的进程判死、或 kill 掉重启，才是真正的问题。
+#   因此这里设的是「进度提示间隔」和「软上限」，而不是「失败上限」：
+#     - 每 10s 打印一次已等待秒数（让用户知道还在跑）
+#     - 超过 DSH_READY_TIMEOUT 后，改为每 30s 打一次「仍在初始化」提示，
+#       并附带日志尾部（便于判断是真在跑还是卡死），继续等
+#     - 仅当进程退出（判失败）或就绪（判成功）才结束
+#   如需硬性放弃，可设 DSH_READY_HARD_TIMEOUT（默认 0 = 不限），
+#   适用于不允许容器长时间处于启动态的场景。
 # ------------------------------------------------------------
 wait_dsh_ready() {
     local label="${1:-DSH}"
     local waited=0
-    # 上限放宽到 120s：给插件首次建 venv / 装依赖留足时间，
-    # 由「进程死亡」和「日志成功行」两个信号来提前结束，而不是靠猜秒数。
-    local max_wait="${DSH_READY_TIMEOUT:-120}"
+    local soft_limit="${DSH_READY_TIMEOUT:-120}"     # 软上限：之后转为低频提示
+    local hard_limit="${DSH_READY_HARD_TIMEOUT:-0}"  # 硬上限：0 = 不限（推荐）
     local next_hint=5
     local alive
 
-    while [ "$waited" -lt "$max_wait" ]; do
+    while true; do
         # (a) 成功信号：日志里出现 dsh web: 行
         if grep -qE 'dsh web: http' "$DSH_LOG" 2>/dev/null; then
             echo "  ${label} 已就绪（${waited}s，插件树加载完成）"
@@ -280,18 +338,30 @@ wait_dsh_ready() {
             return 1
         fi
 
-        # 阶段化进度：让用户知道还在等、等了多久
-        if [ "$waited" -ge "$next_hint" ]; then
-            echo "  ${label} 启动中... ${waited}s（插件初始化中，最长 ${max_wait}s）"
-            next_hint=$((next_hint + 10))
+        # (c) 可选硬上限：默认关闭
+        if [ "$hard_limit" -gt 0 ] && [ "$waited" -ge "$hard_limit" ]; then
+            echo "  ${label} 达到硬上限 ${hard_limit}s 仍未就绪（进程仍在运行）"
+            return 1
+        fi
+
+        # 进度提示：软上限内每 10s 一次；超过后每 30s 一次并附日志尾部
+        if [ "$waited" -lt "$soft_limit" ]; then
+            if [ "$waited" -ge "$next_hint" ]; then
+                echo "  ${label} 启动中... ${waited}s（插件初始化中，超过 ${soft_limit}s 后转为低频提示）"
+                next_hint=$((next_hint + 10))
+            fi
+        else
+            if [ "$waited" -ge "$next_hint" ]; then
+                echo "  ${label} 仍在初始化... 已等待 ${waited}s（进程存活，继续等待；插件首次安装依赖可能较久）"
+                echo "  ---- 日志尾部 ----"
+                tail -n 5 "$DSH_LOG" 2>/dev/null | sed 's/^/    /' || true
+                next_hint=$((next_hint + 30))
+            fi
         fi
 
         sleep 1
         waited=$((waited + 1))
     done
-
-    echo "  ${label} 启动超时（${max_wait}s 内未出现就绪日志）"
-    return 1
 }
 
 # ------------------------------------------------------------
@@ -459,12 +529,13 @@ fi
 #    流程（单轮内完成，不再"先等端口、再另起一轮抓 token"）：
 #      启动 → 等待就绪（以日志出现 `dsh web:` 行为准）→ 直接从中提取 token
 #
-#    为什么只重启一次真正需要的情况：
+#    什么情况才重启：
 #      就绪信号本身就是「插件树全部加载成功」，一旦拿到该行，token 必然
-#      已经在同一行里，不存在"就绪了却没 token"的中间态。因此：
-#        - 成功 → 直接结束，绝不重启
-#        - 进程崩溃 → 重试（真正值得重试的情况，最多 MAX_ROUNDS 轮）
-#        - 超时但进程还活着 → 视为慢启动（插件在装依赖），只告警不重启
+#      已在同一行，不存在"就绪了却没 token"的中间态。因此：
+#        - 成功            → 直接结束，绝不重启
+#        - 进程已退出      → 真崩溃，重试（最多 MAX_ROUNDS 轮）
+#      **"超时"不再是一个失败条件**：wait_dsh_ready 只要进程还活着就会一直等，
+#      因此回到这里只有两种可能 —— 已就绪，或进程已死。
 #
 #    日志期望格式（dsh-web-app，含 LAN 插件时）：
 #      dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)
@@ -483,30 +554,14 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
     start_dsh
 
     if ! wait_dsh_ready "DSH"; then
-        # 就绪失败：区分「进程还活着（慢启动）」与「进程已死（真崩溃）」
-        if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
-            # 进程还活着，只是很慢（插件首次建 venv / 装依赖）。
-            # **不要 kill 重启** —— 那正是"无谓重启"的来源：
-            # 把正在初始化的插件打断，下一轮从零开始，反而更慢。
-            # 改为再等一个完整超时周期，给足时间。
-            echo "  DSH 进程仍在运行，只是尚未就绪 —— 再等一个周期（${DSH_READY_TIMEOUT:-120}s），不重启"
-            if wait_dsh_ready "DSH"; then
-                : # 已就绪，落到下方解析逻辑
-            else
-                echo "  进程存活但两个周期内仍未就绪，最近日志："
-                tail -n 20 "$DSH_LOG" 2>/dev/null || true
-                echo "  已放弃等待（进程仍在后台运行，容器继续看护）"
-                break
-            fi
-        else
-            # 进程已退出：这是真崩溃，值得重启重试
-            if [ "$round" -lt "$MAX_ROUNDS" ]; then
-                echo "  检测到 DSH 启动失败（进程已退出），自动重启重试（第 $((round+1))/${MAX_ROUNDS} 轮）..."
-                continue
-            fi
-            echo "  已重试 ${MAX_ROUNDS} 轮仍未成功，放弃。"
-            break
+        # 能走到这里只有一个原因：进程已退出（真崩溃）。
+        # 进程存活的情况 wait_dsh_ready 不会返回失败。
+        if [ "$round" -lt "$MAX_ROUNDS" ]; then
+            echo "  检测到 DSH 启动失败（进程已退出），自动重启重试（第 $((round + 1))/${MAX_ROUNDS} 轮）..."
+            continue
         fi
+        echo "  已重试 ${MAX_ROUNDS} 轮仍未成功，放弃。"
+        break
     fi
 
     # 就绪即成功：token / URL 必然在同一行，直接解析
@@ -573,6 +628,9 @@ fi
 #      （文件被删除/重建后仍继续跟踪）。
 # ============================================================
 echo "[6/6] 开始跟踪日志 ($DSH_ROOT/log/*/*.log)..."
+# 交接：停掉 [4/6] 启动期的 tail 转发，避免同一份日志被打印两遍。
+# 此后由下面的整合 tail（覆盖全量日志目录）统一输出。
+stop_dsh_log_follow
 # nullglob：无匹配时数组为空，避免把字面量 "/dsh/log/*/*.log" 传给 tail
 shopt -s nullglob
 LOG_FILES=("${DSH_ROOT}"/log/*/*.log)
@@ -591,6 +649,7 @@ TAIL_PID=$!
 
 # 确保退出时清理子进程
 cleanup() {
+    stop_dsh_log_follow
     kill "$TAIL_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
