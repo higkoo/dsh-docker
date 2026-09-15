@@ -134,6 +134,10 @@ jobs:
           # 构建参数：Python 安装模式（apt / source / none，见文件头 env 说明）
           build-args: |
             PYTHON_MODE=${{ env.PYTHON_MODE }}
+            # 把镜像版本烧进镜像，启动时由 entrypoint.sh 首行打印，
+            # 便于现场确认「这台机器跑的是哪一版」。
+            # 优先用 semver（推 tag 触发）；workflow_dispatch 等无 tag 场景回退到 sha。
+            DSH_IMAGE_VERSION=${{ steps.meta.outputs.version }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

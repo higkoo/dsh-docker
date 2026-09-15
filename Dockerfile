@@ -17,6 +17,12 @@ LABEL org.opencontainers.image.source="https://github.com/higkoo/dsh-docker"
 LABEL org.opencontainers.image.description="DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"
 LABEL org.opencontainers.image.licenses="MIT"
 
+# 镜像版本号：由 CI 在构建时通过 --build-arg DSH_IMAGE_VERSION=<tag> 传入，
+# 烧进镜像后由 entrypoint.sh 在启动首行打印，方便排查「这台机器跑的是哪版」。
+ARG DSH_IMAGE_VERSION=dev
+LABEL org.opencontainers.image.version="${DSH_IMAGE_VERSION}"
+ENV DSH_IMAGE_VERSION="${DSH_IMAGE_VERSION}"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ============================================================
