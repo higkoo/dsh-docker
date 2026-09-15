@@ -90,6 +90,8 @@
 | Nginx | 1.26.3 | apt 安装，配置路径软链到 /dsh/ |
 | pnpm | 12.4.1 | npm tarball 手动绿色安装 |
 | DSH | 由 versions.yml 配置 | entrypoint.sh 动态安装 |
+| locale | `C.UTF-8` | 镜像内置 `ENV LANG/LC_ALL`，保证 `less`/`grep` 正确显示中文 |
+| 调试工具 | `less`、`file` | apt 安装，便于进容器查看脚本与日志 |
 
 ### Python 安装模式（`PYTHON_MODE`）
 
@@ -236,13 +238,38 @@ source /dsh/profile.env
 
 ```bash
 # 方式一：临时覆盖（推荐）
-docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.7
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.8
 
 # 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
 ```
 
 `entrypoint.sh` 会自动同步 `/etc/localtime` 与 `/etc/timezone`，无需手动处理；
 若指定的时区在 `zoneinfo` 中不存在，会告警并沿用镜像默认时区。
+
+### 字符编码与中文显示
+
+镜像内置 `LANG=C.UTF-8`、`LC_ALL=C.UTF-8`，容器内查看含中文的脚本/日志时
+`less`、`grep` 等工具均可正常显示。
+
+> **如果早期版本（≤ v0.3.7）里 `less script/entrypoint.sh` 提示
+> `"may be a binary file. See it anyway?"` 且中文显示成 `<E5><8A><A0>` 之类：
+> 这不是脚本编码问题，脚本本身一直是干净的 UTF-8。**
+>
+> 根因是 `debian:*-slim` 基础镜像**不设置任何 locale**，容器内 `LANG`/`LC_ALL` 为空，
+> glibc 回退到 POSIX/C locale（`LC_CTYPE="POSIX"`）。此时 `less` 按**单字节**处理文本，
+> 看到 UTF-8 的中文多字节序列就误判为二进制，并以 `cat -v` 风格逐字节转义输出。
+>
+> 一句话辨别：`head -n 20 script/entrypoint.sh` 输出正常、但 `less` 报二进制
+> —— 问题在显示层的 locale，不在文件内容。
+
+若你的运行环境仍遇到该问题（例如镜像被 `-e LC_ALL=` 覆盖），在容器内临时修复：
+
+```bash
+export LANG=C.UTF-8 LC_ALL=C.UTF-8   # 或启动时加 -e LANG=C.UTF-8
+```
+
+`v0.3.8` 起镜像已同时内置 `less` 与 `file`（slim 镜像默认不含），
+方便进容器排查：`less /dsh/log/dsh/dsh-web.log`、`file /dsh/script/entrypoint.sh`。
 
 ## 版本配置 (versions.yml)
 
@@ -315,14 +342,14 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
 | 标签 | 含义 | 适用场景 |
 |------|------|----------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.3.7` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
+| `v0.3.8` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
 | `v0.3` | 次版本浮动标签，随补丁自动更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
 
 > 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
 > 版本号标签、`X.Y` 浮动标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
 
-**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.7` 及以上版本。
+**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.8` 及以上版本。
 
 > 容器默认使用**北京时间（`Asia/Shanghai`）**，日志与 `date` 均为东八区时间。
 > 详细说明与修改方式见上文「[时区说明](#时区说明)」。
@@ -395,7 +422,7 @@ docker exec dsh-web sh -c 'ls -R /dsh/log'
 ```
 ============================================================
   DSH Docker 容器
-  镜像版本: v0.3.7
+  镜像版本: v0.3.8
   ---- 启动步骤 ----
    [1/6] 检查/安装 DSH 及插件
    [2/6] 生成自签 SSL 证书
@@ -460,11 +487,11 @@ bash test/test_versions_parser.sh
 ### 发布新版本
 
 ```bash
-git tag -a v0.3.7 -m "v0.3.7: 变更说明"
-git push origin v0.3.7
+git tag -a v0.3.8 -m "v0.3.8: 变更说明"
+git push origin v0.3.8
 ```
 
-推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.7`、`v0.3`、`latest` 与 `sha-*` 标签。
+推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.8`、`v0.3`、`latest` 与 `sha-*` 标签。
 
 ## License
 

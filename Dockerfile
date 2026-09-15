@@ -45,16 +45,40 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
 #    libbz2-dev / liblzma-dev）是 **Python 源码编译**
 #    （PYTHON_MODE=source）所需，已下放到第 5 步的条件分支中，
 #    避免 apt / none 模式白白带上这些体积。
+#
+#    less / file：排查容器问题时最常用的两个工具，体积可忽略，故内置。
+#    （基础镜像 debian:*-slim 不含它们，用户进容器查看脚本/日志时
+#      既没法分页阅读，也没法判断文件类型。）
 # ============================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        file \
         gnupg \
         git \
+        less \
         openssl \
         nginx \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------
+# 2.2 字符编码环境（locale）
+#
+#    问题：slim 镜像默认**不设置任何 locale**，容器内 LANG/LC_ALL 均为空，
+#    于是 glibc 回退到 POSIX/C locale（实测 LC_CTYPE="POSIX"）。
+#    后果是 less / grep 等工具按"单字节"处理文本：
+#      - `less foo.sh` 对含中文的 UTF-8 文件报
+#        "may be a binary file. See it anyway?"；
+#      - 强行查看时中文被逐字节转义成 <E5><8A><A0> 之类的乱码。
+#    （注意：文件本身编码没问题，是"显示层"因缺 locale 而误判。）
+#
+#    修法：设 LANG=C.UTF-8。C.UTF-8 是 glibc 内置 locale，
+#    Debian 基础镜像**自带**（`locale -a` 可见 C.utf8），无需 locale-gen，
+#    也不会因缺少 localedef 而失效 —— 比 en_US.UTF-8 更稳、零额外体积。
+# ------------------------------------------------------------
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
 # ============================================================
 # 2.1 构建选项：Python 安装模式（PYTHON_MODE）
