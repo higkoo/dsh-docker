@@ -8,7 +8,7 @@ set -e
 #   2. 生成自签 SSL 证书
 #   3. 启动 DSH Web UI（日志经 FIFO 汇入 dsh-web.log + 终端）
 #   4. 启动 Nginx 反向代理（80 / 443）
-#   5. 重启 DSH 确保插件生效（以 LAN: 日志行为准，最多 3 轮）
+#   5. 确认插件生效并抓取访问 token（以 `dsh web: <url>` 行为准，最多 3 轮）
 #   6. 输出访问地址
 #   7. 前台看护（服务级健康检查，容忍 dsh-ctl 计划内重启）
 # ============================================================
@@ -151,10 +151,35 @@ start_dsh() {
         wait "$DSH_PID" 2>/dev/null || true
         sleep 1
     fi
-    : > "$DSH_LOG"
+
+    # 不要清空 $DSH_LOG。
+    #
+    # 历史实现里这里是 `: > "$DSH_LOG"`，每次启动都截断日志，
+    # 结果就是「第一次启动的 token 被第二次启动抹掉」，dsh.log 看起来总是空的。
+    # 启动日志体量极小（正常只有一行 `dsh web: ...` 或一段启动异常栈），
+    # 保留历史反而对排查有用：能直接看到每一轮的启动记录。
+    #
+    # 若确实想每轮清空（例如日志被异常刷屏），把下面这行取消注释即可：
+    #   : > "$DSH_LOG"
     sync_dsh_log_alias
 
-    dsh web --no-open >&3 2>&3 &
+    # 打印分隔标记，便于在日志里区分第 N 次启动（多轮重试时尤其有用）
+    if [ -w "$DSH_LOG" ]; then
+        echo "----- dsh web 启动 @ $(date '+%Y-%m-%d %H:%M:%S') -----" >> "$DSH_LOG"
+    fi
+
+    # 不传 --no-open：--no-open 会连启动地址一起关掉。
+    #
+    # @deepseek-ai/dsh-web-app 的 startup.js 把 `--no-open` 映射为
+    # openBrowser=false；而 index.js 中打印 URL 的条件是 config.printUrl
+    # （默认 true，独立于 openBrowser）。容器里没有浏览器可开，开浏览器
+    # 那步失败只会往 stderr 打一行提示，不影响服务；但一旦加了 --no-open，
+    # 启动地址就再也不打印，脚本自然永远抓不到 token、也永远看不到 "LAN:" 行。
+    #
+    # 说明：本容器是 127.0.0.1 绑定（见 DSH_WEB_HOST），dsh-web-app 的
+    # resolveLanTrust 只在 0.0.0.0 绑定时才会产出 LAN 地址，因此这里
+    # 正常不会出现 "(LAN: ...)"。外部访问由 nginx 反代 + token 承担。
+    dsh web >&3 2>&3 &
     DSH_PID=$!
     echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 }
@@ -325,13 +350,31 @@ else
 fi
 
 # ============================================================
-# 6. 重启 DSH 确保插件生效
-#    插件在 dsh 启动时加载；装完必须重启才生效。
-#    以 dsh web 日志出现 "LAN:" 行为生效标志，未出现自动再重启，
-#    最多 3 轮（替代手动重启，确保容器启动后 dsh-web-lan-access 生效）
+# 6. 确认插件已生效并抓取访问 token
+#
+#    背景（2026-09 修正）：
+#      旧实现以 dsh web 日志出现 "LAN:" 行作为「dsh-web-lan-access 生效」
+#      的判据，并为此最多重启 3 轮。但 "LAN:" 从来不会出现，原因有二：
+#
+#        1) dsh-web-app 打印的是 `dsh web: <url> (LAN: <url>)`，而 LAN 段
+#           只有在 webserver 绑定 0.0.0.0 时才有值（resolveLanTrust 里
+#           `bindHost === "0.0.0.0"` 才采样非内部 IPv4）。本容器固定绑
+#           127.0.0.1（DSH_WEB_HOST），所以 lanUrl 恒为 undefined。
+#        2) 更关键的是，旧实现给 dsh 传了 `--no-open`。startup.js 把
+#           `--no-open` 映射为 openBrowser=false，而 index.js 中打印
+#           整行 URL 的条件是 printUrl——一旦走 --no-open 分支，连
+#           `dsh web: ...` 这一行都完全不输出。
+#
+#      两个原因叠加，就出现了「服务正常启动、脚本却永远抓不到 token、
+#      日志里也什么都没有、还要空转 3 轮 × 30 秒」的现象。
+#
+#    现在的判据改为：以 `dsh web: <url>` 行为准（token 就在这行里），
+#      既天然证明「插件/服务已就绪」，也一次拿到 token，无需反复重启。
+#      图省事但也足够严谨：拿不到 URL 行才重试，最多 3 轮。
 # ============================================================
-echo "重启 DSH 以确保插件生效..."
+echo "确认 DSH 就绪并获取访问 token..."
 TOKEN=""
+WEB_URL=""
 LAN_URL=""
 for round in 1 2 3; do
     start_dsh
@@ -339,21 +382,23 @@ for round in 1 2 3; do
     echo "等待 DSH 重新就绪 (第 ${round}/3 轮)..."
     wait_dsh_ready "DSH" || exit 1
 
-    # 轮询提取 token（等待日志落盘）
-    for _ in $(seq 1 30); do
-        TOKEN="$(grep -oE 'token=[A-Za-z0-9_-]+' "$DSH_LOG" 2>/dev/null | head -1 | cut -d= -f2 || true)"
-        if [ -n "$TOKEN" ]; then break; fi
+    # 轮询提取启动 URL（dsh-web-app 在 ready 后打印，落盘可能略有延迟）
+    for _ in $(seq 1 15); do
+        # `dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)`
+        WEB_URL="$(grep -oE 'dsh web: [^ ]+' "$DSH_LOG" 2>/dev/null | tail -1 | sed 's/^dsh web: //' || true)"
+        if [ -n "$WEB_URL" ]; then break; fi
         sleep 1
     done
 
-    # LAN: 行是 dsh-web-lan-access 插件生效的标志
-    LAN_URL="$(grep -oE 'LAN: [^ )]+' "$DSH_LOG" 2>/dev/null | head -1 | sed 's/LAN: //' || true)"
-
-    if [ -n "$LAN_URL" ]; then
-        echo "  LAN 插件已生效 (第 ${round} 轮): $LAN_URL"
+    if [ -n "$WEB_URL" ]; then
+        TOKEN="$(printf '%s' "$WEB_URL" | grep -oE 'token=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2 || true)"
+        # LAN 段属可选（仅 0.0.0.0 绑定时出现），有则顺带记录
+        LAN_URL="$(grep -oE '\(LAN: [^)]+\)' "$DSH_LOG" 2>/dev/null | tail -1 | sed -e 's/^(LAN: //' -e 's/)$//' || true)"
+        echo "  DSH 启动地址已捕获 (第 ${round} 轮)"
         break
     fi
-    echo "  第 ${round} 轮未检测到 LAN 地址，自动重启 DSH 重试..."
+
+    echo "  第 ${round} 轮未捕获到启动地址，自动重启 DSH 重试..."
 done
 
 # ============================================================
@@ -364,10 +409,9 @@ if [ -n "$TOKEN" ]; then
     echo "  DSH 已启动！请访问:"
     echo "    HTTP : http://<Your-IP>:${DSH_HTTP_PORT:-9080}/?token=${TOKEN}"
     echo "    HTTPS: https://<Your-IP>:${DSH_HTTPS_PORT:-9443}/?token=${TOKEN}"
+    echo "  容器内直连: ${WEB_URL}"
     if [ -n "$LAN_URL" ]; then
-        echo "  LAN 访问(插件已生效): $LAN_URL"
-    else
-        echo "  警告: 未检测到 LAN 访问地址，dsh-web-lan-access 插件未生效"
+        echo "  LAN 访问: $LAN_URL"
     fi
     echo "  健康检查页面: http://<Your-IP>:${DSH_HTTP_PORT:-9080}/health"
     echo "============================================================"
