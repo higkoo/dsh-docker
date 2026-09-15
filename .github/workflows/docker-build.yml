@@ -16,8 +16,11 @@ env:
   IMAGE_NAME: dsh
   # 版本号不再硬编码：推 tag 时用 tag 名，其余情况自动生成
   #   v1.2.3  -> v1.2.3
-  #   分支推送 -> v0.0.0-<分支>-<短sha>（仅 latest + sha 标签）
+  #   分支推送 -> 空（仅 latest + sha 标签）
   VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+  # OCI 描述文案：Dockerfile 的 LABEL 与 CI 的 index 注解共用同一来源，
+  # 避免两处各写一份导致不一致
+  IMAGE_DESCRIPTION: "DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"
 
 jobs:
   # ============================================================
@@ -82,18 +85,23 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          # 标签优先级决定 org.opencontainers.image.version 的取值：
+          # 高优先级的标签会胜出，因此 semver 必须排在 raw=latest 之前，
+          # 否则推 tag 构建时 version 会被写成 "latest"（而非 vX.Y.Z）。
           tags: |
-            type=raw,value=latest
-            type=raw,value=${{ env.VERSION }},enable=${{ env.VERSION != '' }}
-            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,priority=600
+            type=sha,format=short,priority=200
           # 注意：metadata-action 会自动从仓库元数据派生
           # `manifest:org.opencontainers.image.description` 与 `...licenses`，
-          # 这组 manifest: 标签优先级高于此处手动声明的 labels，
-          # 因此 description 与 license 的**真正来源是仓库设置**
-          # （Settings → Description / License），不要在此重复声明，
-          # 否则会出现两套值并存且被 manifest: 覆盖的困惑。
+          # 这组 manifest: 标签优先级高于此处手动声明的 labels。
+          # 若仓库 Settings 未填写 Description / License，则派生值为空，
+          # 因此这里显式兜底声明，保证镜像内 label 始终有值。
           labels: |
             org.opencontainers.image.title=dsh-docker
+            org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }}
+            org.opencontainers.image.licenses=MIT
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -103,10 +111,17 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # 单平台镜像的 OCI 注解需写入 manifest（annotation. 前缀）。
-          # 若将来改为多平台构建（--platform linux/amd64,linux/arm64），
-          # 必须改用 annotation-index. 前缀，否则 buildx 会报
-          # "index annotations not supported for single platform export"。
-          outputs: "type=image,name=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }},annotation.org.opencontainers.image.description=DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。,annotation.org.opencontainers.image.source=https://github.com/higkoo/dsh-docker,annotation.org.opencontainers.image.licenses=MIT"
+          # ============================================================
+          # OCI 注解必须用 `annotation-index.` 前缀
+          # ------------------------------------------------------------
+          # buildx 会为镜像产出 OCI image index（即 manifest list，
+          # 包含平台 manifest + attestation 证明层）。
+          # GHCR 的 package 页面读取的是 **index 层的 annotations**，
+          # 而不是 image config 里的 label。
+          # 若用 `annotation.`（写入内层 manifest），index 层仍为空，
+          # 页面就会显示 "No description provided"。
+          # 已实测验证：annotation. → index 注解为空；annotation-index. → 正常写入。
+          # ============================================================
+          outputs: "type=image,name=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }},annotation-index.org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }},annotation-index.org.opencontainers.image.source=https://github.com/${{ github.repository }},annotation-index.org.opencontainers.image.licenses=MIT"
           cache-from: type=gha
           cache-to: type=gha,mode=max

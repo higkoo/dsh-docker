@@ -7,10 +7,11 @@ FROM debian:trixie-slim
 #    - description: 单行描述，显示在包名下方（限 512 字符）
 #    - licenses:    SPDX 许可证标识，显示在详情侧栏
 #
-#    注意：CI 构建时 docker/metadata-action 会用 workflow 中声明的
-#    labels 覆盖同名 LABEL，因此描述文案的真正来源是
-#    .github/workflows/docker-build.yml 的 metadata-action 配置。
-#    此处保留相同的值，用于本地 docker build 时也能带上元数据。
+#    注意：这里的 LABEL 写入的是 image config，仅在本地 docker build / inspect 时可见。
+#    GHCR package 页面读取的是 **OCI image index 层的 annotations**，
+#    该层由 CI 中 .github/workflows/docker-build.yml 的 build-push-action
+#    `outputs: ...,annotation-index.*` 写入（必须用 annotation-index. 前缀）。
+#    两处需保持文案一致，CI 与 Dockerfile 共用同一个描述常量。
 # ============================================================
 LABEL org.opencontainers.image.source="https://github.com/higkoo/dsh-docker"
 LABEL org.opencontainers.image.description="DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"
