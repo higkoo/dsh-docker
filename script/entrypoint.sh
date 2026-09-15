@@ -354,6 +354,7 @@ fi
 # ============================================================
 echo "启动 DSH Web UI..."
 TOKEN=""
+WEB_URL=""
 LAN_URL=""
 for round in 1 2 3; do
     start_dsh
@@ -394,10 +395,9 @@ if [ -n "$TOKEN" ]; then
     echo "  DSH 已启动！请访问:"
     echo "    HTTP : http://<Your-IP>:${DSH_HTTP_PORT:-9080}/?token=${TOKEN}"
     echo "    HTTPS: https://<Your-IP>:${DSH_HTTPS_PORT:-9443}/?token=${TOKEN}"
+    echo "  容器内直连: ${WEB_URL}"
     if [ -n "$LAN_URL" ]; then
-        echo "  LAN 访问(插件已生效): $LAN_URL"
-    else
-        echo "  警告: 未检测到 LAN 访问地址，dsh-web-lan-access 插件未生效"
+        echo "  LAN 访问: $LAN_URL"
     fi
     echo "  健康检查页面: http://<Your-IP>:${DSH_HTTP_PORT:-9080}/health"
     echo "============================================================"
