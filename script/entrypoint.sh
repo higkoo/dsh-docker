@@ -96,36 +96,44 @@ sync_dsh_log_alias() {
 }
 
 # ------------------------------------------------------------
-# 日志管道：命名 FIFO + 长驻 tee
+# 日志落盘：直接追加重定向 + 启动自检
 #
-# 为什么不用 `dsh web > >(tee ...) &`：
-#   进程替换 `> >(tee)` 建立的是「当前 shell 的子进程」管道。一旦 DSH
-#   被 dsh-ctl 以 detached 方式在进程外重启，旧 tee 随旧 DSH 一同退出，
-#   新 DSH 的输出就再也进不了 $DSH_LOG（正是「重启后日志无 token」的根因）。
+# 历史实现用「命名 FIFO + 长驻 tee」把 DSH 输出转发到 $DSH_LOG，理由是
+# 让日志写入方与 DSH 生命周期解耦（dsh-ctl 可能在进程外重启 DSH）。
 #
-# 改为「命名管道 + 长驻 tee」：
-#   本脚本创建一个 FIFO，并挂一个长驻 `tee`（写 $DSH_LOG + 终端）。
-#   DSH 的 stdout/stderr 绑定到 FIFO 写端（FD 3）。
-#   好处：日志写入方是长驻 tee，与 DSH 生命周期**解耦**。DSH 重启只换
-#   写端进程，tee 与日志文件持续存在，因此重启后的新 token 必定落盘。
+# 但这个设计有一个**致命的静默失败模式**，实测复现：
+#   tee 是独立后台进程，一旦它退出（容器 stdout 被关闭/写满触发 EPIPE、
+#   被 OOM 杀掉、或被信号误伤），FD 3 的写入端就失了读者。
+#   此后 `dsh web >&3` 的每一次写都只得到 "write error: Broken pipe"，
+#   而这句报错打在**脚本自己的 stderr**上，不住 $DSH_LOG；
+#   `echo`/`>` 写失败又不会触发 set -e。
+#   结果：DSH 服务完全正常、日志文件却只剩脚本直接写进去的内容，
+#   token 永远抓不到，且没有任何迹象说明链路已断
+#   （正是「服务正常、日志为空、token 抓不到」这一现象的根因）。
+#
+# 改为最朴素可靠的方式：DSH 的 stdout/stderr 直接以追加重定向写入日志文件。
+#   - 没有任何中间进程，不存在「转发的进程死了」这种状态；
+#   - 内核保证 append 语义，与 DSH 生命周期天然解耦；
+#   - 跨 dsh-ctl 外部重启也成立（每次启动都重新打开同一文件追加）。
+# 牺牲的是「日志同时回显到容器终端」——改为由前台看护统一 `tail -F`
+# 输出（见脚本末尾），效果等同且不会再有断链风险。
 # ------------------------------------------------------------
-LOG_FIFO="${RUN_DIR}/dsh-log.fifo"
-LOG_TEE_PID=""
 # DSH 启动次数计数器，仅用于日志分隔标记（便于区分多轮重试）
 DSH_START_COUNT=0
 
-setup_log_pipe() {
-    rm -f "$LOG_FIFO"
-    mkfifo "$LOG_FIFO" 2>/dev/null || return 0
-    # 长驻 tee：读 FIFO，同时写日志文件与容器终端
-    tee -a "$DSH_LOG" < "$LOG_FIFO" &
-    LOG_TEE_PID=$!
-    # 打开写端常驻 FD 3；先开读端再开写端，避免 open 阻塞
-    exec 3> "$LOG_FIFO"
+# 启动前自检：确认日志文件确实可写。若不可写则直接报错退出，
+# 避免重演「默默写不进去、事后才发现」的排查困境。
+prepare_log_file() {
+    local dir
+    dir="$(dirname "$DSH_LOG")"
+    mkdir -p "$dir" 2>/dev/null || true
+    if ! ( : >> "$DSH_LOG" ) 2>/dev/null; then
+        echo "错误: 日志文件不可写: $DSH_LOG" >&2
+        exit 1
+    fi
 }
 
-# 建立日志管道（必须在使用 FD 3 之前完成）
-setup_log_pipe
+prepare_log_file
 # 让 relaunch 日志并入 $DSH_LOG，保证 dsh-ctl 外部重启时 token 不丢
 sync_dsh_log_alias
 
@@ -144,7 +152,7 @@ cleanup_stale_pid() {
 }
 
 # ------------------------------------------------------------
-# 启动/重启 DSH：kill 旧进程后重拉，输出经 FD 3 汇入日志（见 setup_log_pipe）
+# 启动/重启 DSH：kill 旧进程后重拉，stdout/stderr 直接追加到 $DSH_LOG
 # ------------------------------------------------------------
 start_dsh() {
     if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
@@ -155,10 +163,9 @@ start_dsh() {
 
     # 注意：这里不要清空 $DSH_LOG。
     #
-    # 旧实现是 `: > "$DSH_LOG"`，每次启动都截断。而本脚本第 3 节先启动过一次
-    # DSH（拿到 token 并写入日志），第 6 节的 for 循环又调用 start_dsh 重启，
-    # 于是第 3 节那次启动的 token 记录被这句截断直接抹掉——
-    # 这正是「服务正常启动，日志里却看不到启动记录 / dsh.log 是空的」的根因。
+    # 旧实现是 `: > "$DSH_LOG"`，每次启动都截断。而本脚本曾先后两次启动 DSH，
+    # 前面的 token 记录会被后一次截断直接抹掉——这正是「服务正常启动，
+    # 日志里却看不到启动记录」的原因之一。
     #
     # 启动日志体量极小（正常一行 `dsh web: ...`，异常时一段栈），
     # 保留历史反而便于对照每一次启动。
@@ -183,7 +190,10 @@ start_dsh() {
     # 不要额外传 --host / --port：dsh-web-lan-access 插件已在 cordis.patch.yml
     # 里把 webserver 绑定覆写为 0.0.0.0（这正是 LAN 段能出现的前提），
     # 脚本不必也不应再干预监听参数。
-    dsh web --no-open >&3 2>&3 &
+    #
+    # 日志：直接追加重定向到文件（不再走 FIFO + tee，理由见文件头部说明）。
+    # 这里显式声明 2>&1，确保 stderr 也不会漏。
+    dsh web --no-open >> "$DSH_LOG" 2>&1 &
     DSH_PID=$!
     echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 }
@@ -244,6 +254,18 @@ ensure_plugin() {
     echo "警告: 插件 $name 补装失败（不影响启动，但相关功能不可用）"
     return 1
 }
+
+# ============================================================
+# 0. 启动横幅：打印镜像版本与关键路径
+#    版本号来自镜像构建期烧入的 DSH_IMAGE_VERSION（未注入时显示 dev）。
+#    排查时第一眼就能确认「这台机器跑的是哪个版本」，避免对着旧镜像查新问题。
+# ============================================================
+echo "============================================================"
+echo "  DSH Docker 容器"
+echo "  镜像版本: ${DSH_IMAGE_VERSION:-dev}"
+echo "  启动时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  根目录  : ${DSH_ROOT}"
+echo "============================================================"
 
 # ============================================================
 # 1. 安装 DSH 及插件（如果尚未安装）
@@ -434,14 +456,9 @@ fi
 tail -F "${LOG_FILES[@]}" 2>/dev/null &
 TAIL_PID=$!
 
-# 确保退出时清理子进程与日志管道
+# 确保退出时清理子进程
 cleanup() {
     kill "$TAIL_PID" 2>/dev/null || true
-    if [ -n "$LOG_TEE_PID" ]; then
-        kill "$LOG_TEE_PID" 2>/dev/null || true
-    fi
-    exec 3>&- 2>/dev/null || true
-    rm -f "$LOG_FIFO" 2>/dev/null || true
 }
 trap cleanup EXIT
 
