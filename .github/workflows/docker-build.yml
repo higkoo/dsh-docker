@@ -9,13 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       python_mode:
-        description: "Python 安装模式：apt（默认，发行版自带 3.13）/ source（源码编译 3.14）/ none（不装）"
+        description: "Python 安装模式：none（默认，不装）/ apt（发行版自带 3.13）/ source（源码编译 3.14）"
         type: choice
         options:
+          - none
           - apt
           - source
-          - none
-        default: apt
+        default: none
 
 permissions:
   packages: write
@@ -27,16 +27,16 @@ env:
   #   v1.2.3  -> v1.2.3
   #   分支推送 -> 空（仅 latest + sha 标签）
   VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-  # Python 安装模式（默认 apt）
+  # Python 安装模式（默认 none）
   # ------------------------------------------------------------
+  #   none   完全不装（默认）—— 镜像最小、构建最快
   #   apt    用 apt 装 Debian 发行版自带的 Python（约 3.13.5）
   #          —— 秒级安装、体积小（stdlib 约 27MB）
   #   source 源码编译指定版本（3.14.7），耗时且体积大，
   #          在 buildx 的 QEMU 环境下编译 arm64 尤其慢
-  #   none   完全不装
   # DSH 本体与内置插件均为 Node.js 实现，运行时不依赖 Python，
-  # 因此默认用代价最低的 apt。手动触发时可临时切换。
-  PYTHON_MODE: ${{ inputs.python_mode || 'apt' }}
+  # 因此默认不装，把构建时间留给功能验证；后续确有需要再开启。
+  PYTHON_MODE: ${{ inputs.python_mode || 'none' }}
   # OCI 描述文案：Dockerfile 的 LABEL 与 CI 的 index 注解共用同一来源，
   # 避免两处各写一份导致不一致
   IMAGE_DESCRIPTION: "DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"

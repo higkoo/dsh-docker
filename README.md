@@ -6,7 +6,7 @@
 
 - **绿色安装**：所有组件（Node.js 24、Python 3.14、Nginx）安装在 `/dsh` 目录下，不污染系统
 - **软链接**：核心二进制软链接到 `/usr/local/bin`，全局可用
-- **可选组件**：Python 由构建参数 `PYTHON_MODE` 控制，默认用 apt 装发行版自带版本，需要锁定版本时可切源码编译（[详见](#python-安装模式python_mode)）
+- **可选组件**：Python 由构建参数 `PYTHON_MODE` 控制，**默认不装**（`none`），需要时切 apt 或用源码编译锁定版本（[详见](#python-安装模式python_mode)）
 - **多平台**：同一标签同时提供 `linux/amd64` 与 `linux/arm64`
 - **阿里云源**：apt 和 npm 均使用国内镜像加速
 - **版本化配置**：通过 `versions.yml` 管理 DSH 及插件版本，支持组件名+版本号和直接 URL 两种安装方式
@@ -85,46 +85,46 @@
 |------|------|----------|
 | Debian | 13 (trixie-slim) | 基础镜像 |
 | Node.js | 24.21.0 LTS | 预编译二进制绿色安装（按目标架构选择 x64 / arm64 包） |
-| Python | 3.13.5（apt）或 3.14.7（source） | **可选**，由 `PYTHON_MODE` 控制，见下节 |
+| Python | 3.13.5（apt）或 3.14.7（source） | **可选且默认不装**（`PYTHON_MODE=none`），见下节 |
 | Nginx | 1.26.3 | apt 安装，配置路径软链到 /dsh/ |
 | pnpm | 12.4.1 | npm tarball 手动绿色安装 |
 | DSH | 由 versions.yml 配置 | entrypoint.sh 动态安装 |
 
 ### Python 安装模式（`PYTHON_MODE`）
 
-Python 是**可选组件**，由构建参数 `PYTHON_MODE` 控制，**默认 `apt`**。
+Python 是**可选组件**，由构建参数 `PYTHON_MODE` 控制，**默认 `none`（不装）**。
 
 | 模式 | 版本 | 安装方式 | 镜像体积 | 构建耗时 |
 |------|------|---------|---------|---------|
-| `apt`（默认） | 3.13.5 | apt 装发行版自带 | 约 550 MB | 秒级 |
+| `none`（默认） | — | 不装 | 约 417 MB | — |
+| `apt` | 3.13.5 | apt 装发行版自带 | 约 550 MB | 秒级 |
 | `source` | 3.14.7 | 源码编译到 `/dsh/app/python/` | 约 1.08 GB | amd64 约 4.5 分钟，arm64 在 QEMU 下显著更久 |
-| `none` | — | 不装 | 约 417 MB | — |
 
 > 体积为 `linux/amd64` 实测值（同条件下对比）。`source` 模式比 `apt` 多出约 530 MB，
 > 主要来自源码编译产物（头文件、静态库、`libpython3.14.so` 等）。
 
-**为什么默认用 apt**：Python 属备用工具链 —— DSH 本体与内置插件均为 Node.js 实现，
+**为什么默认不装**：Python 属备用工具链 —— DSH 本体与内置插件均为 Node.js 实现，
 运行时不依赖 Python（已核查 `script/*.sh`、`config/nginx/`、`versions.yml` 均无 Python 调用）。
-apt 安装系统自带版本无需编译、构建时间可忽略、镜像增量小；只有在**必须锁定特定 Python 版本**
-时才需要切到 `source` 模式编译。
+默认不装可以让镜像最小、构建最快，把 CI 时间集中在功能验证上；后续确有需要时，
+再用 `apt`（省事）或 `source`（锁版本）重新构建即可，无需改动其它配置。
 
 ```bash
-# 默认：apt 装发行版自带 Python
+# 默认：完全不装 Python
 docker build -t dsh .
 
-# 源码编译指定版本（PYTHON_VERSION 可覆盖，默认 3.14.7）
-docker build --build-arg PYTHON_MODE=source -t dsh .
+# 需要时用 apt 装发行版自带 Python
+docker build --build-arg PYTHON_MODE=apt -t dsh .
 
-# 完全不装
-docker build --build-arg PYTHON_MODE=none -t dsh .
+# 或源码编译指定版本（PYTHON_VERSION 可覆盖，默认 3.14.7）
+docker build --build-arg PYTHON_MODE=source -t dsh .
 
 # 多平台构建同理
 docker buildx build --build-arg PYTHON_MODE=source --platform linux/amd64,linux/arm64 -t dsh .
 ```
 
-CI 中默认值写在 `.github/workflows/docker-build.yml` 的 `env.PYTHON_MODE`（默认 `apt`）；
+CI 中默认值写在 `.github/workflows/docker-build.yml` 的 `env.PYTHON_MODE`（默认 `none`）；
 也可在 Actions 页面手动触发 **Build DSH Docker Image** 工作流，用 `python_mode` 下拉项
-选择 `apt` / `source` / `none`，无需改代码。
+选择 `none` / `apt` / `source`，无需改代码。
 
 #### 目录结构对齐
 
@@ -195,7 +195,7 @@ source /dsh/profile.env
 
 ```bash
 # 方式一：临时覆盖（推荐）
-docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.4
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.3.5
 
 # 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
 ```
@@ -274,14 +274,14 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
 | 标签 | 含义 | 适用场景 |
 |------|------|----------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.3.4` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
+| `v0.3.5` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
 | `v0.3` | 次版本浮动标签，随补丁自动更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
 
 > 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
 > 版本号标签、`X.Y` 浮动标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
 
-**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.4` 及以上版本。
+**版本线说明**：`v0.1.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.3.5` 及以上版本。
 
 > 容器默认使用**北京时间（`Asia/Shanghai`）**，日志与 `date` 均为东八区时间。
 > 详细说明与修改方式见上文「[时区说明](#时区说明)」。
@@ -371,11 +371,11 @@ bash test/test_versions_parser.sh
 ### 发布新版本
 
 ```bash
-git tag -a v0.3.4 -m "v0.3.4: 变更说明"
-git push origin v0.3.4
+git tag -a v0.3.5 -m "v0.3.5: 变更说明"
+git push origin v0.3.5
 ```
 
-推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.4`、`v0.3`、`latest` 与 `sha-*` 标签。
+推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.3.5`、`v0.3`、`latest` 与 `sha-*` 标签。
 
 ## License
 

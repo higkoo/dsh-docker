@@ -37,8 +37,8 @@ if [ "$(readlink -f /etc/localtime 2>/dev/null)" != "/usr/share/zoneinfo/${TZ}" 
 fi
 
 # PATH 组装：nodejs 恒存在；python 路径仅在镜像确实装了 Python 时加入。
-# Python 由构建参数 PYTHON_MODE 控制（apt 装发行版自带版本 / source 源码
-# 编译指定版本 / none 不装），默认 apt。
+# Python 由构建参数 PYTHON_MODE 控制（none 不装（默认）/ apt 装发行版自带
+# 版本 / source 源码编译指定版本）。
 # 这里做存在性判断，避免 none 模式下 PATH 里残留指向空目录的条目
 # （虽不影响执行，但会让 `which python` 之类的排查产生误导）。
 DSH_PATH="${DSH_ROOT}/app/nodejs/bin"

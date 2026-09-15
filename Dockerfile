@@ -60,17 +60,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2.1 构建选项：Python 安装模式（PYTHON_MODE）
 # ------------------------------------------------------------
 # 三态取值：
-#   apt    （默认）用 apt 安装 Debian 发行版自带的 Python（约 3.13.5）
+#   none   （默认）完全不安装 Python
+#          —— 镜像最小（约 417MB）、构建最快。DSH 本体与内置插件
+#             均为 Node.js 实现，运行时不依赖 Python，因此默认关闭。
+#   apt    用 apt 安装 Debian 发行版自带的 Python（约 3.13.5）
 #          —— 秒级安装、体积小（stdlib 约 27MB）、与系统库版本天然匹配
 #   source 源码编译安装指定版本（PYTHON_VERSION，默认 3.14.7）
 #          —— 版本可控，但编译耗时长（arm64 在 QEMU 下尤甚）、体积大
-#   none   完全不安装 Python
 #
-# 为什么默认选 apt：
+# 为什么默认 none：
 #   DSH 本体与内置插件均为 Node.js 实现，运行时不依赖 Python
 #   （已核查 script/*.sh、config/nginx/、versions.yml 均无 Python 调用），
-#   Python 属于"备用工具链"。用 apt 装系统自带版本是代价最低的方案：
-#   无需编译、构建时间可忽略、image 增量小；需要精确版本时再切 source。
+#   Python 属于"备用工具链"。默认不装可让镜像更小、构建更快，
+#   把 CI 时间花在功能验证上；后续确有需要再切 apt 或 source 开启。
 #
 # 关于「apt 能否装到 /dsh 目录」：
 #   不能。dpkg 包的安装路径在打包时就已固化，Debian 的 Python 解释器
@@ -84,11 +86,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   上层脚本与 PATH 判断逻辑无需区分模式。
 #
 # 用法：
-#   docker build .                                          # apt（默认）
+#   docker build .                                          # none（默认）
+#   docker build --build-arg PYTHON_MODE=apt .              # apt 安装
 #   docker build --build-arg PYTHON_MODE=source .           # 源码编译
-#   docker build --build-arg PYTHON_MODE=none .             # 不装
 # ============================================================
-ARG PYTHON_MODE=apt
+ARG PYTHON_MODE=none
 
 # ============================================================
 # 3. 创建 /dsh 绿色安装目录结构
