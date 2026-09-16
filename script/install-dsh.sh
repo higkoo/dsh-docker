@@ -5,10 +5,11 @@ set -o pipefail
 
 # ============================================================
 # DSH 及插件安装脚本
-# 读取 /dsh/config/dsh/versions.yml，按配置安装 DSH 和插件
-# 支持两种安装方式：
-#   1. 组件名 + 版本号（npm install -g 包名@版本）
-#   2. 直接指定下载 URL（npm install -g URL）
+#
+# 读取 config/dsh/versions.yml，按配置安装 DSH 与插件。
+# 支持两种方式（可混用）：
+#   1. 组件名 + 版本号  → npm install -g 包名@版本
+#   2. 直接指定 URL     → npm install -g URL
 # ============================================================
 
 DSH_ROOT="${DSH_ROOT:-/dsh}"
@@ -21,8 +22,7 @@ mkdir -p "$LOG_DIR" "$PLUGIN_LOG_DIR"
 
 # ------------------------------------------------------------
 # 提取标量值：剥离行内注释、引号与首尾空白
-#   输入：latest        # 使用 latest 或指定版本
-#   输出：latest
+#   latest        # 使用 latest    →  latest
 # 注意：URL 中可能含 '#'（如 git+https://host/repo#tag），
 #       因此仅当 '#' 前存在空白时才视为注释起始。
 # ------------------------------------------------------------
@@ -36,10 +36,9 @@ extract_scalar() {
         raw="${BASH_REMATCH[1]}"
     fi
 
-    # 先去首尾空白，再剥引号（顺序不可颠倒：'v'  + 尾部空格需先 trim）
+    # 先去首尾空白，再剥引号（顺序不可颠倒：'v' 加尾部空格需先 trim）
     raw="$(echo "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
-    # 剥离成对引号
     raw="${raw%\"}"; raw="${raw#\"}"
     raw="${raw%\'}"; raw="${raw#\'}"
 
@@ -50,12 +49,12 @@ extract_scalar() {
 }
 
 # ------------------------------------------------------------
-# 解析版本配置文件
-#   输出到全局变量：
-#     DSH_VERSION / DSH_URL   —— 仅取 dsh: 段内的字段
-#     PLUGINS                 —— 每行 "name|version|url|profile"
-#   关键：字段解析严格限定在所属缩进段内，避免 dsh 段与
-#         plugins 段的 version:/url: 互相污染。
+# 解析版本配置文件，输出到全局变量：
+#   DSH_VERSION / DSH_URL  —— 仅取 dsh: 段内的字段
+#   PLUGINS                —— 每行 "name|version|url|profile"
+#
+# 字段解析严格限定在所属缩进段内，避免 dsh 段与 plugins 段的
+# version:/url: 互相污染。解析器会自动剥离行尾注释。
 # ------------------------------------------------------------
 parse_versions_file() {
     local file="$1"
@@ -64,28 +63,24 @@ parse_versions_file() {
     DSH_URL=""
     PLUGINS=""
 
-    # 当前所处的顶层段：dsh / plugins / 其他
-    local section=""
-    # plugins 段内当前累积的插件字段
+    local section=""                                  # 当前顶层段：dsh / plugins / 其他
     local cur_name="" cur_version="" cur_url="" cur_profile=""
 
-    # 保存当前插件到 PLUGINS
     flush_plugin() {
         if [ -n "$cur_name" ]; then
             PLUGINS="${PLUGINS}${cur_name}|${cur_version}|${cur_url}|${cur_profile}"$'\n'
         fi
     }
 
-    # `read ... || [ -n "$line" ]` 确保最后一行无换行符时也能被处理，
+    # `read ... || [ -n "$line" ]`：最后一行无换行符时也能处理，
     # 同时避免 set -e 在读到 EOF 时终止脚本
     while IFS= read -r line || [ -n "$line" ]; do
-        # 整行注释 / 空行直接跳过（避免续读时把注释当成数据）
+        # 整行注释 / 空行跳过
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "${line//[[:space:]]/}" ]] && continue
 
         # ---- 顶层段切换（行首无缩进且以 xxx: 结尾）----
         if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*$ ]]; then
-            # 离开 plugins 段时保存最后一个插件
             if [ "$section" = "plugins" ]; then
                 flush_plugin
                 cur_name=""; cur_version=""; cur_url=""; cur_profile=""
@@ -180,8 +175,8 @@ install_dsh() {
 
 # ------------------------------------------------------------
 # 安装单个插件
-#    关键：安装命令返回成功 ≠ 注册成功，必须以 plugin list 为准；
-#    验证失败自动重试（网络抖动/注册未落盘时常见）
+# 关键：安装命令返回成功 ≠ 注册成功，必须以 plugin list 为准，
+#       验证失败自动重试（网络抖动 / 注册未落盘时常见）。
 # ------------------------------------------------------------
 install_plugin() {
     local name="$1"
@@ -189,11 +184,9 @@ install_plugin() {
     local url="$3"
     local profile="$4"
 
-    # 日志文件名需做安全化处理：npm scope 包名形如 @scope/pkg，
-    # 直接拼接会得到 `.../@scope/pkg.log`，即把 scope 当成子目录，
-    # 而该目录并不存在 —— tee 写入失败在 set -o pipefail 下会让整条
-    # 管道返回非零，安装被误判为失败并重试 3 次后中断构建。
-    # 因此把路径分隔符等不安全字符统一替换为 `__`。
+    # 日志文件名需安全化：npm scope 包名形如 @scope/pkg，直接拼接会得到
+    # `.../@scope/pkg.log`（把 scope 当子目录），而该目录不存在 ——
+    # tee 写入失败在 set -o pipefail 下会让整条管道返回非零，安装被误判为失败。
     local log_name="${name//[^A-Za-z0-9._-]/__}"
     local plugin_log="${PLUGIN_LOG_DIR}/${log_name}.log"
     mkdir -p "$PLUGIN_LOG_DIR"
@@ -217,13 +210,11 @@ install_plugin() {
     for attempt in 1 2 3; do
         echo "  [${name}] 安装尝试 ${attempt}/3: $pkg"
         if $install_cmd "$pkg" 2>&1 | tee -a "$plugin_log"; then
-            # 验证注册结果（以 plugin list 为准，而非命令退出码）。
-            #
-            # ⚠ 此处必须用**词边界**匹配，不能写成 `grep -q "$name"`：
-            #   后者会把 dsh-ctl 误判为已在 dsh-ctl-helper 存在时注册成功。
-            #   本表达式与 script/entrypoint.sh 的 plugin_registered()
-            #   **必须逐字一致**（两脚本被 Docker 分别 COPY，无法互相 source），
-            #   修改时请同步两处。
+            # 校验注册结果（以 plugin list 为准，而非命令退出码）。
+            # ⚠ 必须用**词边界**：写成 `grep -q "$name"` 会在 dsh-ctl-helper
+            #   存在时把 dsh-ctl 误判为已注册。
+            #   本表达式与 entrypoint.sh 的 plugin_registered() **必须逐字一致**
+            #   （两脚本被 Docker 分别 COPY，无法互相 source），改一处要同步另一处。
             if dsh plugin --profile "${profile:-web}" list 2>/dev/null \
                 | grep -qE "(^|[^A-Za-z0-9._-])${name}([^A-Za-z0-9._-]|$)"; then
                 registered=1
@@ -259,15 +250,13 @@ main() {
     echo "  时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "============================================================"
 
-    # 解析配置文件
     parse_versions_file "$VERSIONS_FILE"
 
     echo "  DSH 版本: ${DSH_VERSION:-未指定}"
     echo "  DSH URL: ${DSH_URL:-未指定}"
     echo "  插件列表:"
     if [ -n "$PLUGINS" ]; then
-        # 注意：此处用 herestring 而非管道，避免 while 体在子 shell 中执行
-        # `read ... || [ -n "$name" ]` 防止 set -e 在读到 EOF 时终止脚本
+        # 用 herestring 而非管道，避免 while 体在子 shell 中执行
         while IFS='|' read -r name version url profile || [ -n "$name" ]; do
             [ -n "$name" ] || continue
             echo "    - $name (版本=${version:-latest}, 配置档=${profile:-web})"
@@ -277,16 +266,15 @@ main() {
     fi
     echo ""
 
-    # 安装 DSH
     install_dsh
 
-    # 安装插件（herestring 循环，失败计数不丢子 shell）
     if [ -n "$PLUGINS" ]; then
         echo ""
         echo "============================================================"
         echo "安装插件"
         echo "============================================================"
 
+        # herestring 循环：失败计数不会丢在子 shell 里
         local failed=0
         while IFS='|' read -r name version url profile || [ -n "$name" ]; do
             if [ -n "$name" ]; then
