@@ -170,9 +170,18 @@ docker build --build-arg PYTHON_MODE=source -t dsh .
 ### 先看这三个地方
 
 ```bash
-docker logs dsh-web                    # 前台跟踪了全部日志，先看这个
+docker logs -f dsh-web                  # 前台实时跟踪【全部】日志，先看这个
 docker exec dsh-web ls -R /dsh/log     # 完整日志树
 docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
+```
+
+`docker logs` 会把 `/dsh/log/*/*.log` 下**所有**日志实时转发到终端，
+每行带 `[HH:MM:SS]` 时间戳。运行中新出现的日志文件（比如刚装的插件）
+也会自动被纳入，无需重启容器：
+
+```
+[18:12:17] ==> /dsh/log/nginx/access.log <==
+[18:12:17] 127.0.0.1 - - [16/Sep/2026:18:12:17 +0800] "GET / HTTP/1.1" 401 79
 ```
 
 日志按来源分目录存放，找问题直接去对应目录：
@@ -188,6 +197,7 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 | 现象 | 大概率原因 | 怎么办 |
 |------|-----------|--------|
 | 一直「DSH 启动中...」 | 数据分析插件在建 venv、装依赖，正常 | 等 1~3 分钟，心跳还在就别动它 |
+| 日志停在「dsh web 启动 #1」不动 | DSH 正在装插件的重依赖，中间不写日志属正常 | 看 `[18:12:17] ==> install.log <==` 段是否在刷 |
 | 容器 `exit 1` 退出 | 就绪超时，通常是**容器连不上 npm registry** | 检查网络/代理；日志末尾会打印原因 |
 | 日志里一堆 Node 崩溃栈，提到 `plugin tree failed to load` | 某个插件加载失败（如 `none` 模式下缺 Python） | 用默认 `apt` 模式重构建 |
 | 访问 401 / 页面空白 | token 不对或没带 | 用 `tail -1` 重新取；`dshctl` 重启后 token 会变 |
@@ -211,7 +221,7 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 | 标签 | 含义 | 场景 |
 |------|------|------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.4.1` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
+| `v0.4.2` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
 | `v0.4` | 次版本浮动，随补丁更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 |
 
@@ -294,8 +304,8 @@ bash test/test_versions_parser.sh    # versions.yml 解析器边界测试（CI �
 发布新版本：
 
 ```bash
-git tag -a v0.4.1 -m "v0.4.1: 变更说明"
-git push origin v0.4.1               # CI 自动 lint → 构建 → 推送镜像
+git tag -a v0.4.2 -m "v0.4.2: 变更说明"
+git push origin v0.4.2               # CI 自动 lint → 构建 → 推送镜像
 ```
 
 ## License

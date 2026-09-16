@@ -16,6 +16,8 @@
 3. [日志落盘：为什么放弃了 FIFO + tee](#3-日志落盘为什么放弃了-fifo--tee)
 4. [进程看护：为什么用 HTTP 可用性而不是 PID](#4-进程看护为什么用-http-可用性而不是-pid)
    - [4.1 `$!` 的坑：别把日志管道当成 DSH 进程](#41--的坑别把日志管道当成-dsh-进程)
+   - [4.2 `wait` 的坑：管道只 kill 尾端，`wait` 会等整个 job](#42-wait-的坑管道只-kill-尾端wait-会等整个-job)
+   - [4.3 日志转发：为什么不是一条 `tail -F` 就完事](#43-日志转发为什么不是一条-tail--f-就完事)
 5. [访问 token 的生命周期](#5-访问-token-的生命周期)
 6. [Python 与内置插件的依赖关系](#6-python-与内置插件的依赖关系)
 7. [apt 与 source 两种模式的目录对齐](#7-apt-与-source-两种模式的目录对齐)
@@ -167,6 +169,125 @@ DSH_FOLLOW_PID=$!
 > 回归测试见 `test/test_versions_parser.sh` 用例 13：它直接从 `entrypoint.sh`
 > 抽取 `start_dsh` 的**真实语句顺序**执行，断言 `DSH_PID` 指向 `dsh` 真身
 > 而非管道进程 —— 手写一份"正确顺序"来测是抓不到这个 bug 的。
+
+### 4.2 `wait` 的坑：管道只 kill 尾端，`wait` 会等整个 job
+
+这是 v0.4.2 修的缺陷，**v0.4.0 / v0.4.1 都有**。它是「看护循环从未运行」的真凶。
+
+`stop_dsh_log_follow()` 曾这么写：
+
+```bash
+pkill -P "$DSH_FOLLOW_PID" 2>/dev/null || true   # ① 命令根本不存在
+kill "$DSH_FOLLOW_PID" 2>/dev/null || true       # ② 只杀掉尾端 grep
+wait "$DSH_FOLLOW_PID" 2>/dev/null || true       # ③ 会等到整条管道结束
+```
+
+三处问题叠加成**永久阻塞**：
+
+| # | 问题 | 说明 |
+|---|------|------|
+| ① | 容器内**没有 `ps` / `pkill`** | slim 镜像，`pkill` 恒返回 127（被 `\|\| true` 吞掉），`tail`/`sed` **从未被清理** |
+| ② | `$!` 只是**尾端** | 与 §4.1 同源：`DSH_FOLLOW_PID` 记的是 `grep`，`tail`/`sed` 管不着 |
+| ③ | `wait` 等的是 **job**，不是 PID | 管道是一个 job；kill 掉尾端 `grep` 后 `tail`/`sed` 仍存活 → job 不结束 → `wait` 返回不了 |
+
+`set -e` 下在顶层调用，`wait` 就是**死等**，没有任何超时或信号能救它。
+后果链条：
+
+```
+[6/6] → stop_dsh_log_follow → wait 永久阻塞
+                              ↘ 下面的看护 while 循环 never runs
+                                 ↳ 容器永久 running、DSH 崩了也不退出
+```
+
+**实测表现**：日志停在 `[6/6] 开始跟踪日志...` 之后再无输出；
+`ps`-less 环境里连 `sleep 10` 心跳进程都不存在；宿主机看 PID 1 阻塞在
+`wait4(-1)`；额外代价是每轮泄漏一对孤儿 `tail`/`sed`（PPID 变 1）。
+
+修复要点：
+
+- 变量从单值 `DSH_FOLLOW_PID` 改为**数组** `DSH_FOLLOW_PIDS`；
+- 新增 `collect_pipe_children()`，遍历 `/proc` 按 **`PPid == $$`** 反查，
+  把管道三段全部收齐（无 `ps`/`pkill` 时这是唯一可行手段）；
+- `stop_dsh_log_follow()` **删掉 `wait`** —— 这是挂起的直接原因；
+  改为逐个 `kill`，再兜底扫一遍 `PPid == $$` 的成员。
+
+> 容器内实测：修复前该函数**无限挂起**（2 分钟未返回）；
+> 修复后 **0.064s** 返回，管道清理干净、零残留、零误伤。
+> 回归测试见用例 14：起真实 `tail|sed|grep` 管道后调用函数，
+> 用后台 watchdog 计时，断言「必须在 3s 内返回」。
+
+同理，`start_dsh()` 重试路径里 `wait "$DSH_PID"` 也有同源风险（`dsh` 是
+pnpm 包装壳，kill 掉壳后子进程可能仍在），已改为**限时轮询**（最多 5s）。
+
+**通用教训**：在 shell 里，`wait` 只应对**明确的单个进程 PID** 使用；
+面对管道 / 包装器这类「一个 `$!` 背后可能有多个进程」的场景，
+宁可用 `kill -0` 轮询 + `/proc` 实查，也不要 `wait`。
+
+### 4.3 日志转发：为什么不是一条 `tail -F` 就完事
+
+把 `/dsh/log/*/*.log` 转发到终端（`docker logs`）看着简单，但要做到「可靠」，
+有四件事必须一起处理，缺一件用户就会觉得「日志没刷新」：
+
+| # | 要求 | 不做的后果 |
+|---|------|-----------|
+| 1 | 覆盖**全部**日志文件 | 只跟 `dsh-web.log` 时，DSH 首次启动装依赖的那 ~9 分钟里，nginx / 插件日志全不可见 |
+| 2 | 每行带 `[HH:MM:SS]` | 多文件混排时分不清哪行是什么时候产生的 |
+| 3 | 运行中**新建**的文件也要跟 | 新装插件新建的 `.log` 永远看不到（`tail -F` 只能重启跟踪**参数里已有**的文件） |
+| 4 | 停止时**不漏孤儿** | 每次重启都泄漏一对 `tail`/`while`，越积越多 |
+
+实现上对应四个要点：
+
+**要点 1 —— 覆盖 + 纳新**。转发整体放进一个 **supervisor 子 shell**：
+
+```bash
+start_log_follow() {
+    stop_log_follow
+    (
+        mapfile -t files < <(collect_log_files)      # 当前全部日志文件
+        tail -F "${files[@]}" 2>/dev/null | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            printf '[%(%H:%M:%S)T] %s\n' -1 "$line"  # 内建格式化，零 fork
+        done
+    ) &
+    LOG_TAIL_PID=$!
+    LOG_FILES_SNAPSHOT="$(collect_log_files | tr '\n' ' ')"
+}
+```
+
+看护循环每 10s 比一次 `log_files_changed`，集合变了就整体重启转发
+（`tail` 没法动态加参数，只能重启）。
+
+**要点 2 —— 时间戳为什么不用 `awk`**。最直觉的写法是
+`awk '{ printf "[%s] %s\n", strftime("%H:%M:%S"), $0 }'`，但
+**slim 镜像里的 mawk 不保证有 `strftime`** ——实测静默输出 0 行，非常隐蔽。
+`date` 每行 fork 一次又太重。最终用 **bash 内建的
+`printf '%(%H:%M:%S)T'`**：零 fork，2000 行实测 < 1s 处理完。
+
+**要点 3 —— 清理顺序决定成败**。supervisor 是子 shell，`tail` 和 `while`
+都是它的**子孙**。这里藏着一个坑：
+
+```
+先 kill supervisor → 子孙被 reparent 到 PID 1 → PPID 链断了 → 再也找不到
+```
+
+所以必须**先列全子孙、再统一 kill**：
+
+```bash
+local -a victims=("$LOG_TAIL_PID")
+while IFS= read -r pid; do victims+=("$pid"); done \
+    < <(collect_tail_children "$LOG_TAIL_PID")
+for pid in "${victims[@]}"; do kill "$pid" 2>/dev/null || true; done
+```
+
+`collect_tail_children` 靠 `/proc/<pid>/status` 的 `PPid` 逐层 BFS
+（容器内无 `pkill` / `ps`）。
+
+**要点 4 —— [4/6] 与 [6/6] 共用同一个转发器**。早先两处各写一份，
+[4/6] 只看一个文件、[6/6] 才看全部，于是「启动期看不到日志」。
+现在两处都调 `start_log_follow`，行为一致。
+
+> 回归测试见用例 15：造一个真实日志目录，断言转发覆盖全部文件、
+> 每行带时间戳、新建文件能被 `log_files_changed` 检出、清理后无孤儿。
 
 ---
 
