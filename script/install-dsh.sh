@@ -142,7 +142,7 @@ install_dsh() {
     # 版本号合法性校验：解析器已剥离注释，此处再做一道防线，
     # 避免带空格/井号的脏值拼进 npm 包名导致安装静默失败
     if [[ "$version" =~ [[:space:]#] ]]; then
-        echo "  错误：解析出的版本号含非法字符: [$version]"
+        echo "  错误：解析出的版本号含非法字符：[$version]"
         echo "        请检查 $VERSIONS_FILE 中 dsh.version 的写法（行尾注释无需手动删除）"
         return 1
     fi
@@ -175,7 +175,7 @@ install_dsh() {
         echo "  警告：未找到可执行文件 $dsh_bin"
     fi
 
-    echo "  DSH 安装完成: $(dsh --version 2>&1 || echo 'unknown')"
+    echo "  DSH 安装完成：$(dsh --version 2>&1 || echo '未知')"
 }
 
 # ------------------------------------------------------------
@@ -201,7 +201,7 @@ install_plugin() {
     echo "安装插件: $name"
     echo "  版本: ${version:-未指定}"
     echo "  URL: ${url:-未指定}"
-    echo "  Profile: ${profile:-default}"
+    echo "  配置档: ${profile:-web}"
     echo "------------------------------------------------------------"
 
     # 确定安装包标识：url 优先，其次 name@version，最后 name（latest）
@@ -212,13 +212,20 @@ install_plugin() {
         pkg="${name}@${version}"
     fi
 
-    local install_cmd="dsh plugin --profile ${profile:-default} add"
+    local install_cmd="dsh plugin --profile ${profile:-web} add"
     local registered=""
     for attempt in 1 2 3; do
         echo "  [${name}] 安装尝试 ${attempt}/3: $pkg"
         if $install_cmd "$pkg" 2>&1 | tee -a "$plugin_log"; then
-            # 验证注册结果（以 plugin list 为准，而非命令退出码）
-            if dsh plugin --profile "${profile:-default}" list 2>/dev/null | grep -q "$name"; then
+            # 验证注册结果（以 plugin list 为准，而非命令退出码）。
+            #
+            # ⚠ 此处必须用**词边界**匹配，不能写成 `grep -q "$name"`：
+            #   后者会把 dsh-ctl 误判为已在 dsh-ctl-helper 存在时注册成功。
+            #   本表达式与 script/entrypoint.sh 的 plugin_registered()
+            #   **必须逐字一致**（两脚本被 Docker 分别 COPY，无法互相 source），
+            #   修改时请同步两处。
+            if dsh plugin --profile "${profile:-web}" list 2>/dev/null \
+                | grep -qE "(^|[^A-Za-z0-9._-])${name}([^A-Za-z0-9._-]|$)"; then
                 registered=1
                 break
             fi
@@ -232,7 +239,7 @@ install_plugin() {
     if [ -n "$registered" ]; then
         echo "  插件 $name 安装并注册成功"
     else
-        echo "  错误: 插件 $name 安装/注册失败（已重试 3 次）"
+        echo "  错误：插件 $name 安装/注册失败（已重试 3 次）"
         return 1
     fi
 }
@@ -242,7 +249,7 @@ install_plugin() {
 # ------------------------------------------------------------
 main() {
     if [ ! -f "$VERSIONS_FILE" ]; then
-        echo "错误：版本配置文件不存在: $VERSIONS_FILE"
+        echo "错误：版本配置文件不存在：$VERSIONS_FILE"
         exit 1
     fi
 
@@ -263,7 +270,7 @@ main() {
         # `read ... || [ -n "$name" ]` 防止 set -e 在读到 EOF 时终止脚本
         while IFS='|' read -r name version url profile || [ -n "$name" ]; do
             [ -n "$name" ] || continue
-            echo "    - $name (version=${version:-latest}, profile=${profile:-default})"
+            echo "    - $name (版本=${version:-latest}, 配置档=${profile:-web})"
         done <<< "$PLUGINS"
     else
         echo "    (无)"
@@ -288,7 +295,7 @@ main() {
         done <<< "$PLUGINS"
 
         if [ "$failed" -gt 0 ]; then
-            echo "错误: ${failed} 个插件安装/注册失败"
+            echo "错误：${failed} 个插件安装/注册失败"
             exit 1
         fi
     fi
@@ -296,7 +303,7 @@ main() {
     echo ""
     echo "============================================================"
     echo "所有组件安装完成"
-    echo "  DSH: $(dsh --version 2>&1 || echo 'unknown')"
+    echo "  DSH: $(dsh --version 2>&1 || echo '未知')"
     echo "  时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "============================================================"
 }

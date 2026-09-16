@@ -218,6 +218,81 @@ assert_eq "末行插件被捕获" "1" "$(printf '%s' "$NONL_OUT" | grep -c '^LIS
 rm -f "$NONL"
 echo
 
+# ---------- 用例11: 插件名校验必须带词边界 ----------
+# install-dsh.sh 与 entrypoint.sh 各有一份「插件是否已注册」的校验，
+# 两处表达式必须一致，且必须带词边界 —— 否则 dsh-ctl 会在 dsh-ctl-helper
+# 存在时被误判为「已注册」，导致真正缺失的插件不被补装。
+echo "[用例11] 插件名校验词边界（dsh-ctl 不得匹配 dsh-ctl-helper）"
+WB_LIST_WITH_HELPER='dsh-web-lan-access@1.3.2
+dsh-ctl-helper@9.9.9'
+WB_LIST_REAL='dsh-web-lan-access@1.3.2
+dsh-ctl@0.1.1'
+
+# 校验两个脚本都含词边界写法，且都不再有无词边界的旧写法。
+# 用固定子串判断，避免在测试里嵌套正则转义（易错且难读）。
+WB_SUBSTR='(^|[^A-Za-z0-9._-])'          # 词边界表达式独有的片段
+assert_eq "install-dsh.sh 使用词边界表达式" "1" "$(grep -cF "$WB_SUBSTR" "$SCRIPT_DIR/install-dsh.sh")"
+assert_eq "entrypoint.sh 使用词边界表达式" "1" "$(grep -cF "$WB_SUBSTR" "$SCRIPT_DIR/entrypoint.sh")"
+# 旧写法：grep -q "$name"（无 -E、无边界）——两脚本都不该再有。
+# 注意排除注释行（注释里可能提到这个反面写法作为说明）。
+for f in install-dsh.sh entrypoint.sh; do
+    old_cnt="$(grep -v '^[[:space:]]*#' "$SCRIPT_DIR/$f" | grep -cF 'grep -q "$name"')"
+    assert_eq "$f 已无无词边界写法（代码中）" "0" "$old_cnt"
+done
+
+# 行为验证：复刻新表达式的判定
+wb_match() {
+    printf '%s\n' "$1" | grep -qE "(^|[^A-Za-z0-9._-])dsh-ctl([^A-Za-z0-9._-]|\$)"
+}
+if wb_match "$WB_LIST_WITH_HELPER"; then
+    assert_eq "仅存在 dsh-ctl-helper 时不得判定 dsh-ctl 已注册" "未匹配" "匹配"
+else
+    assert_eq "仅存在 dsh-ctl-helper 时不得判定 dsh-ctl 已注册" "未匹配" "未匹配"
+fi
+if wb_match "$WB_LIST_REAL"; then
+    assert_eq "dsh-ctl 确实存在时应判定为已注册" "匹配" "匹配"
+else
+    assert_eq "dsh-ctl 确实存在时应判定为已注册" "匹配" "未匹配"
+fi
+echo
+
+# ============================================================
+# 用例12：访问地址必须保留 token，且地址块标题可定制
+#
+# 回归背景：parse_dsh_access 曾用 sed 主动删掉 ?token=，
+# 结果「容器内直连 / LAN 访问」两行复制即 401；
+# 另外看护期复用「已就绪」标题，与「只是 token 变了」的语义不符。
+# ============================================================
+echo "[用例12] 访问地址保留 token 且标题可定制"
+ACCESS_TMP="$(mktemp /tmp/access_XXXX.log)"
+ACCESS_SCRIPT="$(mktemp /tmp/access_XXXX.sh)"
+cat > "$ACCESS_SCRIPT" <<'ACCESS_EOF'
+#!/usr/bin/env bash
+DSH_LOG="$1"; DSH_HTTP_PORT=9080; DSH_HTTPS_PORT=9443
+ACCESS_EOF
+{
+    sed -n '/^parse_dsh_access()/,/^}/p' "$SCRIPT_DIR/entrypoint.sh"
+    sed -n '/^print_access_info()/,/^}/p' "$SCRIPT_DIR/entrypoint.sh"
+    cat <<'ACCESS_EOF'
+parse_dsh_access
+printf 'TOKEN=%s\n' "$TOKEN"
+printf 'WEB_HAS_TOKEN=%s\n' "$(printf '%s' "$WEB_URL"  | grep -c 'token=TK1')"
+printf 'LAN_HAS_TOKEN=%s\n' "$(printf '%s' "$LAN_URL"  | grep -c 'token=TK1')"
+printf 'TITLE_DEFAULT=%s\n' "$(print_access_info "[5/6]" | sed -n '2p')"
+printf 'TITLE_CUSTOM=%s\n'  "$(print_access_info "[看护]" "DSH 已重启，token 已更新，新访问地址" | sed -n '2p')"
+ACCESS_EOF
+} >> "$ACCESS_SCRIPT"
+
+printf 'dsh web: http://127.0.0.1:3080/?token=TK1 (LAN: http://10.0.0.9:3080/?token=TK1)\n' > "$ACCESS_TMP"
+ACCESS_OUT="$(bash "$ACCESS_SCRIPT" "$ACCESS_TMP" 2>/dev/null)"
+assert_eq "token 解析正确"           "TOKEN=TK1"      "$(printf '%s' "$ACCESS_OUT" | sed -n '1p')"
+assert_eq "容器内直连保留 token"      "WEB_HAS_TOKEN=1" "$(printf '%s' "$ACCESS_OUT" | sed -n '2p')"
+assert_eq "LAN 访问保留 token"       "LAN_HAS_TOKEN=1" "$(printf '%s' "$ACCESS_OUT" | sed -n '3p')"
+assert_eq "默认标题为「已就绪」"      "TITLE_DEFAULT=  [5/6] DSH 已就绪，请访问:" "$(printf '%s' "$ACCESS_OUT" | sed -n '4p')"
+assert_eq "看护标题可定制"           "TITLE_CUSTOM=  [看护] DSH 已重启，token 已更新，新访问地址:" "$(printf '%s' "$ACCESS_OUT" | sed -n '5p')"
+rm -f "$ACCESS_TMP" "$ACCESS_SCRIPT"
+echo
+
 echo "============================================"
 printf " 通过: \033[32m%d\033[0m   失败: \033[31m%d\033[0m\n" "$PASS" "$FAIL"
 echo "============================================"

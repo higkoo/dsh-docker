@@ -76,7 +76,7 @@ if [ -x "${DSH_ROOT}/app/python/bin/python3" ]; then
     export DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON="${DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON:-${DSH_ROOT}/app/python/bin/python3}"
     echo "  Python 引导解释器: ${DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON}"
 else
-    echo "  警告: 未检测到 Python，依赖 Python 的插件将无法加载"
+    echo "  警告：未检测到 Python，依赖 Python 的插件将无法加载"
 fi
 
 DSH_LOG_DIR="${DSH_ROOT}/log/dsh"
@@ -165,7 +165,7 @@ prepare_log_file() {
     dir="$(dirname "$DSH_LOG")"
     mkdir -p "$dir" 2>/dev/null || true
     if ! ( : >> "$DSH_LOG" ) 2>/dev/null; then
-        echo "错误: 日志文件不可写: $DSH_LOG" >&2
+        echo "错误：日志文件不可写：$DSH_LOG" >&2
         exit 1
     fi
 }
@@ -198,16 +198,9 @@ start_dsh() {
         sleep 1
     fi
 
-    # 注意：这里不要清空 $DSH_LOG。
-    #
-    # 旧实现是 `: > "$DSH_LOG"`，每次启动都截断。而本脚本曾先后两次启动 DSH，
-    # 前面的 token 记录会被后一次截断直接抹掉——这正是「服务正常启动，
-    # 日志里却看不到启动记录」的原因之一。
-    #
-    # 启动日志体量极小（正常一行 `dsh web: ...`，异常时一段栈），
-    # 保留历史反而便于对照每一次启动。
-    #
-    # 若确实需要每轮清空，把下面这行取消注释即可：
+    # 不清空 $DSH_LOG：旧实现每次启动都截断，会抹掉上一轮（含 dsh-ctl
+    # 重启后新进程）的 token 记录 —— 而 token 解析正是靠「取日志最后一条」。
+    # 需要每轮清空时，把下行取消注释：
     #   : > "$DSH_LOG"
     sync_dsh_log_alias
 
@@ -221,33 +214,15 @@ start_dsh() {
         echo "----- dsh web 启动 #${DSH_START_COUNT} @ $(date '+%Y-%m-%d %H:%M:%S') -----" >> "$DSH_LOG"
     fi
 
-    # 保留 --no-open：它只表示「不要自动打开浏览器」，不影响启动日志里的
-    # `dsh web: <url>?token=...` 那一行（实测该行照常输出）。
-    # 容器内没有浏览器，即便不传也只是多打一行 "opening the default browser" 提示，
-    # 传上更干净。
+    # --no-open：容器内无浏览器，不传只会多打一行 "opening the default browser"。
+    # 该 flag 不影响日志里 `dsh web: <url>?token=...` 那行的输出。
+    # 不传 --host/--port：绑定由 dsh-web-lan-access 插件覆写为 0.0.0.0（LAN 段的前提）。
     #
-    # 不要额外传 --host / --port：dsh-web-lan-access 插件已在 cordis.patch.yml
-    # 里把 webserver 绑定覆写为 0.0.0.0（这正是 LAN 段能出现的前提），
-    # 脚本不必也不应再干预监听参数。
-    #
-    # 日志：先落到文件（保留完整记录），再由后台 tail 实时转发到容器终端。
-    #
-    # 为什么要在启动阶段就转发：
-    #   DSH 初始化插件是**正常的慢过程**（dsh-data-analysis 首次要建 venv、
-    #   装 marivo/pandas，1~3 分钟）。这段时间如果终端一片空白，用户会以为
-    #   卡死了，进而做无谓的重启/改动。所以启动期就把 dsh 自己的日志实时打出来，
-    #   让人看到「正在加载 xx 插件」这类进度。主流程另有每 10s 的等待心跳，
-    #   两者配合，终端始终有内容。
-    #
-    # 为什么用 `tail -F` 转发而不是直接 `tee`：
-    #   1) 文件里必须是**原始日志**（不含 [dsh] 前缀），否则主流程解析
-    #      `dsh web: http...` 那行会被前缀污染；
-    #   2) `tail -F` 不占管道、不阻塞写入，dsh 退出后 tail 自然结束；
-    #   3) 与 [6/6] 阶段统一用 tail -F 转发，逻辑一致。
-    #
-    # 关键：必须先创建文件再 `tail -F`，否则某些环境会先报
-    #   "cannot open ... for reading: No such file or directory"。
-    # 这里显式声明 2>&1，确保 stderr 也不会漏。
+    # 日志：先落文件（保留原始记录，供主流程解析 `dsh web:` 行），
+    # 再由后台 tail -F 转发到终端（带 [dsh] 前缀）—— 这样启动期就能看到
+    # 「正在加载 xx 插件」的进度，而不是一片空白让人以为卡死。
+    # 前缀只加在转发流上，不污染文件，故解析不受影响。
+    # 必须先 touch 再 tail -F，否则会报 "cannot open ... No such file or directory"。
     touch "$DSH_LOG" 2>/dev/null || true
     dsh web --no-open >> "$DSH_LOG" 2>&1 &
 
@@ -371,7 +346,11 @@ wait_dsh_ready() {
 plugin_registered() {
     local name="$1"
     local profile="${2:-web}"
-    # 按词边界匹配，避免 dsh-ctl 误匹配 dsh-ctl-helper 之类的子串
+    # 按词边界匹配，避免 dsh-ctl 误匹配 dsh-ctl-helper 之类的子串。
+    #
+    # ⚠ 本表达式与 script/install-dsh.sh 的 install_plugin() 中校验逻辑
+    #   **必须逐字一致**（两脚本被 Docker 分别 COPY，无法互相 source），
+    #   修改时请同步两处。
     dsh plugin --profile "$profile" list 2>/dev/null | grep -qE "(^|[^A-Za-z0-9._-])${name}([^A-Za-z0-9._-]|$)"
 }
 
@@ -380,7 +359,7 @@ ensure_plugin() {
     local profile="${2:-web}"
 
     if plugin_registered "$name" "$profile"; then
-        echo "插件 $name 已注册 (profile: $profile)"
+        echo "插件 $name 已注册（配置档: $profile）"
         return 0
     fi
 
@@ -398,7 +377,7 @@ ensure_plugin() {
         fi
         sleep 2
     done
-    echo "警告: 插件 $name 补装失败（不影响启动，但相关功能不可用）"
+    echo "警告：插件 $name 补装失败（不影响启动，但相关功能不可用）"
     return 1
 }
 
@@ -412,14 +391,7 @@ echo "  DSH Docker 容器"
 echo "  镜像版本: ${DSH_IMAGE_VERSION:-dev}"
 echo "  启动时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  根目录  : ${DSH_ROOT}"
-echo "  ---- 启动步骤 ----"
-echo "   [1/6] 检查/安装 DSH 及插件"
-echo "   [2/6] 生成自签 SSL 证书"
-echo "   [3/6] 启动 Nginx 反向代理 (80/443)"
-echo "   [4/6] 启动 DSH Web UI 并获取访问 token"
-echo "   [5/6] 输出访问地址"
-echo "   [6/6] 进入看护模式（前台）"
-echo "  提示: DSH 首次启动需初始化插件（可能 10~40s），就绪以日志出现"
+echo "  提示：DSH 首次启动需初始化插件（通常 10~40s），就绪以日志出现"
 echo "        'dsh web:' 行为准，届时会打印访问地址。"
 echo "============================================================"
 
@@ -430,12 +402,12 @@ if ! command -v dsh &>/dev/null; then
     echo "[1/6] DSH 尚未安装，执行安装脚本..."
     if ! bash "${DSH_ROOT}/script/install-dsh.sh"; then
         echo "============================================================"
-        echo "  错误: DSH 安装脚本执行失败"
+        echo "  错误：DSH 安装脚本执行失败"
         echo "  日志: ${DSH_LOG_DIR}/install.log"
         echo "  ---- 最近 30 行 ----"
         tail -n 30 "${DSH_LOG_DIR}/install.log" 2>/dev/null || true
         echo "============================================================"
-        echo "  常见原因: 容器无法访问 npm registry（网络/代理/DNS）。"
+        echo "  常见原因：容器无法访问 npm registry（网络/代理/DNS）。"
         echo "  容器将退出（exit 1）。"
         exit 1
     fi
@@ -445,7 +417,7 @@ fi
 
 # 安装后再确认一次，避免 install-dsh.sh 静默失败导致后续 start_dsh 报 command not found
 if ! command -v dsh &>/dev/null; then
-    echo "错误: dsh 命令不可用，安装未成功"
+    echo "错误：dsh 命令不可用，安装未成功"
     exit 1
 fi
 
@@ -481,7 +453,7 @@ echo "[3/6] 启动 Nginx 反向代理 (port 80/443)..."
 cleanup_stale_pid
 
 if ! nginx -c "${DSH_ROOT}/config/nginx/nginx.conf" 2>&1; then
-    echo "  错误: Nginx 启动失败，配置检查输出如下："
+    echo "  错误：Nginx 启动失败，配置检查输出如下："
     nginx -t -c "${DSH_ROOT}/config/nginx/nginx.conf" 2>&1 || true
     exit 1
 fi
@@ -495,13 +467,13 @@ done
 if [ -s "$NGINX_PID_FILE" ]; then
     NGINX_PID="$(cat "$NGINX_PID_FILE")"
     if kill -0 "$NGINX_PID" 2>/dev/null; then
-        echo "  Nginx PID: $NGINX_PID"
+        echo "  Nginx 进程 PID: $NGINX_PID"
     else
-        echo "  错误: Nginx pid 文件中的进程不存在 ($NGINX_PID)"
+        echo "  错误：Nginx pid 文件中的进程不存在 ($NGINX_PID)"
         exit 1
     fi
 else
-    echo "  错误: Nginx 未生成 pid 文件 ($NGINX_PID_FILE)"
+    echo "  错误：Nginx 未生成 pid 文件 ($NGINX_PID_FILE)"
     exit 1
 fi
 
@@ -518,10 +490,64 @@ done
 if [ "$NGINX_OK" = true ]; then
     echo "  Nginx 健康检查通过"
 else
-    echo "  错误: Nginx 健康检查未通过，请检查 ${NGINX_LOG_DIR}/error.log"
+    echo "  错误：Nginx 健康检查未通过，请检查 ${NGINX_LOG_DIR}/error.log"
     tail -n 20 "${NGINX_LOG_DIR}/error.log" 2>/dev/null || true
     exit 1
 fi
+
+# ------------------------------------------------------------
+# 从 $DSH_LOG 解析当前有效的 token 与访问地址。
+#
+# 为什么取「最后一条」`dsh web:` 行：
+#   dsh-ctl 重启 DSH 时会生成**新 token**，并把新的 `dsh web:` 行
+#   追加到同一份日志（日志不截断，且 relaunch 日志经软链并入）。
+#   因此日志中最后一条即当前有效值。
+#
+# 副作用：设置全局 TOKEN / WEB_URL / LAN_URL。
+# ------------------------------------------------------------
+parse_dsh_access() {
+    # 日志行形如：
+    #   dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)
+    # 统一以「dsh web: 」之后的内容为基准，避免把前缀带进 URL。
+    #
+    # 注意：WEB_URL / LAN_URL 都**保留** ?token= 参数。
+    #   DSH Web UI 是 token 鉴权的（README「访问」一节），去掉 token 后
+    #   用户复制过去只会得到 401，反而要多做一次「怎么又要 token」的排查。
+    local line
+    line="$(grep -oE 'dsh web: http[^ ]*' "$DSH_LOG" 2>/dev/null | tail -1 | sed 's/^dsh web: //' || true)"
+    TOKEN="$(printf '%s' "$line" | grep -oE 'token=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2 || true)"
+    WEB_URL="$(printf '%s' "$line" | grep -oE 'https?://[^ ]*' | head -1 || true)"
+    # LAN 段：从整行里取 LAN: 后面的 URL（同样保留 token）
+    LAN_URL="$(grep -oE 'LAN: [^ )]+' "$DSH_LOG" 2>/dev/null | tail -1 \
+        | sed -E 's/^LAN: //' || true)"
+}
+
+# ------------------------------------------------------------
+# 打印访问地址块。
+#
+# 用法：print_access_info <标签> [标题]
+#   $1 标签，如 "[5/6]" / "[看护]"（必填）
+#   $2 标题，缺省为「DSH 已就绪，请访问」（看护期传自定义文案，
+#      避免在「只是 token 变了」的场合又说一次「已就绪」）
+# [5/6] 首次就绪与看护期 token 变更复用同一份地址块，
+# 避免两处各写一份而漂移。
+# ------------------------------------------------------------
+print_access_info() {
+    local tag="${1:-[5/6]}"
+    local title="${2:-DSH 已就绪，请访问}"
+    echo "============================================================"
+    echo "  $tag $title:"
+    echo "    HTTP : http://<你的IP>:${DSH_HTTP_PORT:-9080}/?token=${TOKEN}"
+    echo "    HTTPS: https://<你的IP>:${DSH_HTTPS_PORT:-9443}/?token=${TOKEN}"
+    if [ -n "$WEB_URL" ]; then
+        echo "  容器内直连: ${WEB_URL}"
+    fi
+    if [ -n "$LAN_URL" ] && [ "$LAN_URL" != "$WEB_URL" ]; then
+        echo "  LAN 访问: $LAN_URL"
+    fi
+    echo "  健康检查页面: http://<你的IP>:${DSH_HTTP_PORT:-9080}/health"
+    echo "============================================================"
+}
 
 # ============================================================
 # 4. 启动 DSH 并抓取访问 token
@@ -565,15 +591,7 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
     fi
 
     # 就绪即成功：token / URL 必然在同一行，直接解析
-    # 日志行形如：
-    #   dsh web: http://127.0.0.1:3080/?token=xxx (LAN: http://ip:3080/?token=xxx)
-    # 下面统一以「dsh web: 」之后的内容为基准，避免把前缀带进 URL。
-    DSH_LINE="$(grep -oE 'dsh web: http[^ ]*' "$DSH_LOG" 2>/dev/null | tail -1 | sed 's/^dsh web: //' || true)"
-    TOKEN="$(printf '%s' "$DSH_LINE" | grep -oE 'token=[A-Za-z0-9_-]+' | head -1 | cut -d= -f2 || true)"
-    WEB_URL="$(printf '%s' "$DSH_LINE" | sed -E 's/[?]token=[A-Za-z0-9_-]+//' || true)"
-    # LAN 段：从整行里取 LAN: 后面的 URL，去掉其 ?token= 参数
-    LAN_URL="$(grep -oE 'LAN: [^ )]+' "$DSH_LOG" 2>/dev/null | tail -1 \
-        | sed -E 's/^LAN: //; s/[?]token=[A-Za-z0-9_-]+//' || true)"
+    parse_dsh_access
 
     if [ -n "$TOKEN" ]; then
         if [ -n "$LAN_URL" ]; then
@@ -583,7 +601,7 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
     fi
 
     # 理论上不会到这里（就绪行必然含 token），保留兜底
-    echo "  警告: 已出现就绪行但未能解析出 token，原始行：$DSH_LINE"
+    echo "  警告：已出现就绪行但未能解析出 token，请检查日志：$DSH_LOG"
     if [ "$round" -lt "$MAX_ROUNDS" ]; then
         echo "  重试中..."
         continue
@@ -595,19 +613,10 @@ done
 # 5. 输出访问地址
 # ============================================================
 if [ -n "$TOKEN" ]; then
-    echo "============================================================"
-    echo "  [5/6] DSH 已就绪，请访问:"
-    echo "    HTTP : http://<Your-IP>:${DSH_HTTP_PORT:-9080}/?token=${TOKEN}"
-    echo "    HTTPS: https://<Your-IP>:${DSH_HTTPS_PORT:-9443}/?token=${TOKEN}"
-    echo "  容器内直连: ${WEB_URL}"
-    if [ -n "$LAN_URL" ]; then
-        echo "  LAN 访问: $LAN_URL"
-    fi
-    echo "  健康检查页面: http://<Your-IP>:${DSH_HTTP_PORT:-9080}/health"
-    echo "============================================================"
+    print_access_info "[5/6]"
 else
     echo "============================================================"
-    echo "  错误: DSH 启动失败，未能获得访问 token"
+    echo "  错误：DSH 启动失败，未能获得访问 token"
     echo "  日志: $DSH_LOG"
     echo "  ---- 最近 40 行 ----"
     tail -n 40 "$DSH_LOG" 2>/dev/null || true
@@ -675,7 +684,10 @@ trap cleanup EXIT
 #   Nginx 不参与重启交接，保持严格的 PID 判定。
 # ------------------------------------------------------------
 DSH_DOWN_SINCE=0
-DSH_DOWN_GRACE=90   # 容忍重启交接的最大秒数（relaunch.mjs 默认等待窗口 45s + 余量）
+# 容忍重启交接的最大秒数（relaunch.mjs 默认等待窗口 45s + 余量）。
+# 用 :- 保留 profile.env / docker -e 传入的值，避免在此处无条件覆盖，
+# 否则 README「就绪判定」表里承诺的「可在 profile.env 调整」就是空话。
+DSH_DOWN_GRACE="${DSH_DOWN_GRACE:-90}"
 
 dsh_service_alive() {
     curl -s -o /dev/null --max-time 3 "$DSH_HEALTH_URL" 2>/dev/null
@@ -712,10 +724,22 @@ while true; do
         DSH_DOWN_SINCE=0
         live_pid="$(resolve_dsh_pid_by_port 2>/dev/null || echo '')"
         if [ -n "$live_pid" ] && [ "$live_pid" != "$DSH_PID" ]; then
-            echo "  [watchdog] DSH 已由外部重启，实际 PID: $DSH_PID -> $live_pid"
+            echo "  [看护] DSH 已由外部重启，实际 PID: $DSH_PID -> $live_pid"
             DSH_PID="$live_pid"
             # 同步 PID 文件，避免后续误读过期的旧值
             echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
+
+            # DSH 重启会生成**新 token**（README「关于 dshctl 重启后的 token」已载明），
+            # 而首屏打印的地址用的是旧 token —— 若不刷新，用户手里的链接会静默失效。
+            # 这里重新解析并重新打印，且**仅在 token 真的变化时**才打印：
+            # 否则每 10s 轮询都会刷一屏，把日志淹掉。
+            #
+            # 注意：此处是顶层 while，不能用 local（ShellCheck SC2168）。
+            prev_token="$TOKEN"
+            parse_dsh_access
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "$prev_token" ]; then
+                print_access_info "[看护]" "DSH 已重启，token 已更新，新访问地址"
+            fi
         fi
     else
         if [ "$DSH_DOWN_SINCE" -eq 0 ]; then
@@ -723,14 +747,14 @@ while true; do
             # 区分「进程还在、只是暂时不响应」与「进程已死、正在等交接」，
             # 让观察窗口里的状态不再是一句含糊的"暂不可达"。
             if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
-                echo "  [watchdog] DSH 进程仍在 (PID ${DSH_PID}) 但 HTTP 无响应，观察中（最长 ${DSH_DOWN_GRACE}s）..."
+                echo "  [看护] DSH 进程仍在 (PID ${DSH_PID}) 但 HTTP 无响应，观察中（最长 ${DSH_DOWN_GRACE}s）..."
             else
-                echo "  [watchdog] DSH 进程已退出，检测到外部重启（dsh-ctl）或崩溃，等待服务恢复（最长 ${DSH_DOWN_GRACE}s）..."
+                echo "  [看护] DSH 进程已退出，检测到外部重启（dsh-ctl）或崩溃，等待服务恢复（最长 ${DSH_DOWN_GRACE}s）..."
             fi
         fi
         down_for=$(( $(date +%s) - DSH_DOWN_SINCE ))
         if [ "$down_for" -ge "$DSH_DOWN_GRACE" ]; then
-            echo "  [watchdog] DSH 服务连续不可达 ${down_for}s（超过 ${DSH_DOWN_GRACE}s 宽限），判定为故障，容器即将退出"
+            echo "  [看护] DSH 服务连续不可达 ${down_for}s（超过 ${DSH_DOWN_GRACE}s 宽限），判定为故障，容器即将退出"
             echo "  ---- 最近 40 行日志 ----"
             tail -n 40 "$DSH_LOG" 2>/dev/null || true
             exit 1
@@ -739,7 +763,7 @@ while true; do
 
     # --- Nginx 存活判定（Nginx 不参与重启交接，保持严格判定）---
     if [ -n "$NGINX_PID" ] && ! kill -0 "$NGINX_PID" 2>/dev/null; then
-        echo "  [watchdog] Nginx 进程 ($NGINX_PID) 已退出，容器即将退出"
+        echo "  [看护] Nginx 进程 ($NGINX_PID) 已退出，容器即将退出"
         tail -n 50 "${NGINX_LOG_DIR}/error.log" 2>/dev/null || true
         exit 1
     fi
