@@ -293,6 +293,40 @@ assert_eq "看护标题可定制"           "TITLE_CUSTOM=  [看护] DSH 已重�
 rm -f "$ACCESS_TMP" "$ACCESS_SCRIPT"
 echo
 
+# ============================================================
+# 用例13：DSH_PID 必须指向 dsh 进程，而非日志转发管道
+#
+# 回归背景：`DSH_PID=$!` 曾紧跟 `tail|sed|grep &`，而管道后台作业的 $!
+# 是**管道最后一段（grep）的 PID**，于是 DSH_PID 记成了 grep：
+# kill -0 永远成功 → DSH 真崩溃也判不出「进程已退出」→ 容器永卡启动态。
+# ============================================================
+echo "[用例13] DSH_PID 必须指向 dsh 进程，而非日志转发管道"
+PID_TEST="$(mktemp /tmp/pidtest_XXXX.sh)"
+{
+    echo '#!/usr/bin/env bash'
+    echo '# dsh 用 sleep 冒充真身；其余语句直接从 entrypoint.sh 的 start_dsh 抽取，'
+    echo '# 保证测的是**源码真实顺序**，而不是手写的正确版本。'
+    echo 'dsh() { exec sleep 300; }'
+    echo 'DSH_LOG=/tmp/pidtest_log_$$.txt; touch "$DSH_LOG"; RUN_DIR=/tmp'
+    echo 'DSH_START_COUNT=0; sync_dsh_log_alias() { :; }; DSH_PID=""; DSH_FOLLOW_PID=""'
+    # 抽取 start_dsh 的完整函数体（含 dsh 启动、DSH_PID 赋值、tail 管道），
+    # 顺序完全由源码决定 —— 旧顺序会让 DSH_PID 最终指向 grep。
+    sed -n '/^start_dsh()/,/^}/p' "$SCRIPT_DIR/entrypoint.sh"
+    echo 'start_dsh >/dev/null 2>&1'
+    echo 'echo "DSH_PID_NAME=$(ps -o comm= -p "$DSH_PID" 2>/dev/null | tr -d " ")"'
+    echo 'echo "FOLLOW_IS_PIPE=$(ps -o comm= -p "$DSH_FOLLOW_PID" 2>/dev/null | tr -d " ")"'
+    echo 'kill "$DSH_PID" 2>/dev/null || true; sleep 1'
+    echo 'kill -0 "$DSH_PID" 2>/dev/null && echo "AFTER_KILL=alive" || echo "AFTER_KILL=dead"'
+    echo 'kill "$DSH_FOLLOW_PID" 2>/dev/null || true; pkill -P "$DSH_FOLLOW_PID" 2>/dev/null || true'
+    echo 'rm -f "$DSH_LOG"'
+} > "$PID_TEST"
+PID_OUT="$(bash "$PID_TEST" 2>/dev/null)"
+assert_eq "DSH_PID 指向 dsh 真身（非管道进程）" "DSH_PID_NAME=sleep" "$(printf '%s' "$PID_OUT" | sed -n '1p')"
+assert_eq "DSH_FOLLOW_PID 指向管道（对照）"     "FOLLOW_IS_PIPE=grep" "$(printf '%s' "$PID_OUT" | sed -n '2p')"
+assert_eq "dsh 退出后 kill -0 判据生效"         "AFTER_KILL=dead"   "$(printf '%s' "$PID_OUT" | sed -n '3p')"
+rm -f "$PID_TEST"
+echo
+
 echo "============================================"
 printf " 通过: \033[32m%d\033[0m   失败: \033[31m%d\033[0m\n" "$PASS" "$FAIL"
 echo "============================================"

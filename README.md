@@ -2,334 +2,12 @@
 
 基于 Docker 一键部署 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) 的绿色安装镜像方案。
 
-## 核心特性
+所有组件（Node.js 24、Python、Nginx）都装在 `/dsh` 目录下，**不污染系统**；容器一条命令拉起，
+启动完会直接把带 token 的访问地址打到你脸上。
 
-- **绿色安装**：所有组件（Node.js 24、Python 3.14、Nginx）安装在 `/dsh` 目录下，不污染系统
-- **软链接**：核心二进制软链接到 `/usr/local/bin`，全局可用
-- **Python 开箱可用**：默认装发行版自带 Python（`PYTHON_MODE=apt`），内置的数据分析插件开箱即用；需要锁版本时可切源码编译，也可用 `none` 极致瘦身（[详见](#python-安装模式python_mode)）
-- **多平台**：同一标签同时提供 `linux/amd64` 与 `linux/arm64`
-- **阿里云源**：apt 和 npm 均使用国内镜像加速
-- **版本化配置**：通过 `versions.yml` 管理 DSH 及插件版本，支持组件名+版本号和直接 URL 两种安装方式
-- **Ansible 编排**：提供 Ansible Playbook 读取版本配置并自动部署
-- **健康检查**：Nginx 提供 `/health` 状态页面；DSH 就绪判定以**日志出现 `dsh web:` 行为准**（而非仅探测端口），避免「端口通但后端已崩」的假阳性
-- **状态透明**：启动全程按 `[1/6]`~`[6/6]` 阶段输出，慢启动时打印进度与已等待秒数，不再是含糊的「已就绪/未检测到」
-- **进程看护**：内置服务级 watchdog，以 HTTP 可用性判定存活；DSH/Nginx 意外退出时容器一并退出，便于 `restart_policy` 拉起
-- **重启友好**：`dshctl restart` 等计划内重启不会被误判为崩溃，重启后新 token 会追加写入日志
-- **时区可配**：默认北京时间（`Asia/Shanghai`），`date` 与 Nginx 日志时间戳均为东八区
-- **日志集中**：所有日志统一存放在 `/dsh/log/<分类>/*.log` 下；容器前台跟踪全部日志，`docker logs` 一览无余
+---
 
-## /dsh 目录结构
-
-```
-/dsh/
-├── app/                         # 应用程序安装目录（绿色安装）
-│   ├── nodejs/                  # Node.js 24（预编译二进制）
-│   │   ├── bin/                 # node, npm, npx, pnpm
-│   │   └── lib/                 # 全局 npm 包
-│   └── python/                  # Python（PYTHON_MODE 控制，默认 apt 安装）
-│       ├── bin/                 # python3, pip3      ← none 模式时不存在
-│       ├── lib/                 # 仅 source 模式：Python 标准库 + 共享库
-│       └── venv/                # Python 虚拟环境
-│
-├── profile.env                  # 环境变量配置（可手动 source 生效）
-│
-├── config/                      # 配置文件目录
-│   ├── nginx/                   # Nginx 配置
-│   │   ├── nginx.conf           # Nginx 主配置
-│   │   ├── conf.d/              # 站点配置目录
-│   │   │   └── dsh-proxy.conf   # DSH 反向代理 + 健康检查
-│   │   └── ssl/                 # SSL 证书目录
-│   │       ├── dsh.crt          # 自签证书（容器首次启动时生成）
-│   │       └── dsh.key          # 私钥
-│   ├── dsh/                     # DSH 配置
-│   │   └── versions.yml         # DSH 及插件版本配置
-│   └── ansible/                 # Ansible 部署脚本（构建时复制进镜像）
-│       ├── playbook.yml         # 部署 Playbook
-│       └── inventory.ini        # 主机清单
-│
-├── log/                         # 日志目录（分类管理）
-│   ├── nginx/                   # Nginx 日志
-│   │   ├── access.log           # 访问日志
-│   │   └── error.log            # 错误日志
-│   ├── dsh/                     # DSH 运行日志
-│   │   ├── dsh-web.log          # Web UI 运行日志
-│   │   └── install.log          # 安装日志
-│   └── plugins/                 # 插件日志
-│       ├── dsh-web-lan-access.log
-│       ├── dsh-ctl.log
-│       ├── dsh-ctl-relaunch.log # ctl 重启 DSH 的接力日志（含重启后的新 token）
-│       └── __chengxianglibra__dsh-data-analysis.log  # 数据分析插件（包名 '/' 已安全化）
-│
-├── run/                         # 运行时目录
-│   ├── nginx.pid                # Nginx PID（由 nginx 自身写入）
-│   └── dsh.pid                  # DSH PID
-│
-├── workspace/                   # DSH 工作区
-│
-├── home/                        # DSH 数据目录（DSH_HOME）
-│   └── profiles/                # 插件 profile 目录
-│
-└── script/                      # 脚本目录
-    ├── entrypoint.sh            # 容器启动入口
-    └── install-dsh.sh           # DSH 及插件安装脚本
-```
-
-> **Nginx 路径说明**：Nginx 二进制由 apt 安装（`/usr/sbin/nginx`），但所有配置与日志路径
-> 已通过软链接指向 `/dsh/`：
-> `/etc/nginx/nginx.conf` → `/dsh/config/nginx/nginx.conf`，
-> `/etc/nginx/conf.d` → `/dsh/config/nginx/conf.d`，
-> `/var/log/nginx` → `/dsh/log/nginx`。
-
-## 技术栈
-
-| 组件 | 版本 | 安装方式 |
-|------|------|----------|
-| Debian | 13 (trixie-slim) | 基础镜像 |
-| Node.js | 24.21.0 LTS | 预编译二进制绿色安装（按目标架构选择 x64 / arm64 包） |
-| Python | 3.13.5（apt，默认）或 3.14.7（source） | 由 `PYTHON_MODE` 控制，默认 apt；`none` 会禁用 Python 插件，见下节 |
-| Nginx | 1.26.3 | apt 安装，配置路径软链到 /dsh/ |
-| pnpm | 12.4.1 | npm tarball 手动绿色安装 |
-| DSH | 由 versions.yml 配置 | entrypoint.sh 动态安装 |
-| locale | `C.UTF-8` | 镜像内置 `ENV LANG/LC_ALL`，保证 `less`/`grep` 正确显示中文 |
-| 调试工具 | `less`、`file` | apt 安装，便于进容器查看脚本与日志 |
-
-### Python 安装模式（`PYTHON_MODE`）
-
-Python 由构建参数 `PYTHON_MODE` 控制，**默认 `apt`**。
-
-| 模式 | 版本 | 安装方式 | 镜像体积 | 构建耗时 |
-|------|------|---------|---------|---------|
-| `apt`（默认） | 3.13.5 | apt 装发行版自带 | 约 550 MB | 秒级 |
-| `source` | 3.14.7 | 源码编译到 `/dsh/app/python/` | 约 1.08 GB | amd64 约 4.5 分钟，arm64 在 QEMU 下显著更久 |
-| `none` | — | 不装 | 约 417 MB | — |
-
-> 体积为 `linux/amd64` 实测值（同条件下对比）。`source` 模式比 `apt` 多出约 530 MB，
-> 主要来自源码编译产物（头文件、静态库、`libpython3.14.so` 等）。
-
-**为什么默认装 Python（而不是 `none`）**：内置插件
-`@chengxianglibra/dsh-data-analysis`（Web profile 的数据分析能力）**强依赖本地 Python** ——
-插件加载时会执行 `python3 -m venv` 建运行时，再在其中安装 `marivo`/`pandas`，
-要求 **Python ≥ 3.10 且带 `venv`/`ensurepip`**。
-
-若镜像里没有 Python，该插件 `apply()` 会抛 `MarivoEnvironmentError`，导致 cordis **整棵插件树
-加载失败**，DSH 进程随即退出 —— 现象就是「服务起不来、拿不到 token、日志里全是 Node 崩溃栈」：
-
-```
-Error: dsh: plugin tree failed to load: failed to apply loader entry dsh-data-analysis
-(@chengxianglibra/dsh-data-analysis): Could not validate local Python.
-Install Python 3.10+ with venv/ensurepip, or set bootstrapPythonExecutable to its absolute path.
-  code: 'shared-runtime-install-failed'
-```
-
-DSH **本体**确实不依赖 Python，但**这个内置插件依赖**，因此默认必须带上。
-只有在明确不需要数据分析功能、且愿意放弃该插件时，才用 `none` 极致瘦身。
-
-```bash
-# 默认：apt 装发行版自带 Python
-docker build -t dsh .
-
-# 源码编译指定版本（PYTHON_VERSION 可覆盖，默认 3.14.7）
-docker build --build-arg PYTHON_MODE=source -t dsh .
-
-# 完全不装（注意：会让 dsh-data-analysis 插件加载失败）
-docker build --build-arg PYTHON_MODE=none -t dsh .
-
-# 多平台构建同理
-docker buildx build --build-arg PYTHON_MODE=source --platform linux/amd64,linux/arm64 -t dsh .
-```
-
-CI 中默认值写在 `.github/workflows/docker-build.yml` 的 `env.PYTHON_MODE`（默认 `apt`）；
-也可在 Actions 页面手动触发 **Build DSH Docker Image** 工作流，用 `python_mode` 下拉项
-选择 `apt` / `source` / `none`，无需改代码。
-
-#### 插件如何找到 Python（`DSH_DATA_ANALYSIS_*` 环境变量）
-
-`dsh-data-analysis` 插件按 「插件 `config` → 环境变量 → 默认值」 的顺序定位解释器。
-它**不使用镜像里的 `/dsh/app/python/venv`**，而是用自己的**托管运行时**：
-用引导解释器执行 `python3 -m venv <runtimeRoot>/.venv`，再在其中安装 `marivo`/`pandas`。
-
-容器启动时 `entrypoint.sh` / `profile.env` 会自动导出引导解释器的绝对路径，
-插件无需依赖 `PATH` 搜索：
-
-| 环境变量 | 本镜像是否设置 | 用途 |
-|---------|--------------|------|
-| `DSH_DATA_ANALYSIS_BOOTSTRAP_PYTHON` | **是** → `/dsh/app/python/bin/python3` | 引导解释器，插件用它创建托管 venv |
-| `DSH_DATA_ANALYSIS_PYTHON` | 否（刻意留空） | 指向插件**托管运行时内**的解释器；设错会让插件重建运行时 |
-| `DSH_DATA_ANALYSIS_RUNTIME_ROOT` | 否 | 自定义托管运行时根目录（一般不用设） |
-| `DSH_DATA_ANALYSIS_PROJECT_ROOT` | 否 | 自定义项目根目录（一般不用设） |
-
-> **为什么只设 `BOOTSTRAP_PYTHON`**：插件在校验已有运行时时，会把
-> `pythonExecutable` 与它自己记录的 `<runtimeRoot>/.venv/bin/python` 做**严格相等**比较。
-> 若我们把它指到 `/dsh/app/python/venv`，校验必然不通过，插件每次启动都会**重建**自己的运行时。
-> 因此只提供「引导解释器」，让插件按自身设计创建/复用其 venv。
->
-> 该变量只在镜像确实装了 Python 时才导出（`none` 模式不设置）。
-> 显式导出是为了兜底 `PATH` 被覆盖、或 `dsh-ctl` 从进程外拉起 DSH 等场景。
-> 如需自定义，在 `docker run -e` 或 `/dsh/profile.env` 中覆盖即可 ——
-> 脚本使用 `${VAR:-默认值}`，已存在的值不会被覆盖。
-
-
-#### 目录结构对齐
-
-apt **无法**把 Python 装到 `/dsh` —— dpkg 包的安装路径在打包时就已固化，Debian 的
-Python 把 `/usr` 编译进了 `sys.prefix`（实测 `sys.prefix=/usr`），共享库位于
-`/usr/lib/<triplet>/`，整体重定位会直接破坏解释器。
-
-因此 apt 模式采用折中方案，让 `/dsh` 下的目录约定在两种模式下保持一致：
-
-| 路径 | apt 模式 | source 模式 |
-|------|---------|------------|
-| `/dsh/app/python/bin/python3` | 软链 → `/usr/bin/python3` | 真实文件（编译产物） |
-| `/dsh/app/python/bin/pip3` | 软链 → venv 内 pip | 软链 → venv 内 pip |
-| `/dsh/app/python/venv/` | venv（基于系统解释器） | venv（基于 3.14.7） |
-
-> 三种模式下 `PATH` 都保持干净：`profile.env` 与 `entrypoint.sh` 会先判断
-> `/dsh/app/python/bin/python3` 是否存在，存在才把 Python 路径追加进 `PATH`。
-> 构建结束时会自检模式与实际产物是否一致，不一致会直接构建失败。
-
-### 支持的平台
-
-镜像为**多平台构建**，同一标签下同时提供两种架构，Docker 会自动选择匹配当前主机的版本：
-
-| 平台 | 说明 |
-|------|------|
-| `linux/amd64` | x86-64 服务器 / 常规云主机 |
-| `linux/arm64` | ARM64 服务器、Apple Silicon（M 系列）Mac |
-
-> 构建时 Dockerfile 通过 `TARGETARCH` 自动映射 Node.js 的架构命名
-> （`amd64` → `x64`、`arm64` → `arm64`），Python 为源码编译、Nginx 走 apt，
-> 二者天然支持上述架构。其它架构（如 `386`、`riscv64`）不受支持，构建会显式报错。
-
-指定平台拉取（一般无需手动指定）：
-
-```bash
-docker pull --platform linux/arm64 ghcr.io/higkoo/dsh:latest
-```
-
-## 环境变量
-
-所有环境变量集中配置在 `/dsh/profile.env`，显式可见。可在容器内手动执行生效：
-
-```bash
-source /dsh/profile.env
-```
-
-修改后重启容器即自动加载，也可用 `docker run -e` 覆盖同名变量。
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `DSH_ROOT` | `/dsh` | 绿色安装根目录 |
-| `DSH_HOME` | `/dsh/home` | DSH 数据目录（profile、插件等） |
-| `DSH_WEB_HOST` | `127.0.0.1` | DSH Web UI 监听地址（Nginx 反代目标） |
-| `DSH_WEB_PORT` | `3080` | DSH Web UI 监听端口 |
-| `DSH_HTTP_PORT` | `9080` | 对外 HTTP 端口（仅用于启动提示，实际以 `docker run -p` 为准） |
-| `DSH_HTTPS_PORT` | `9443` | 对外 HTTPS 端口（仅用于启动提示，实际以 `docker run -p` 为准） |
-| `TZ` | `Asia/Shanghai` | 容器时区（北京时间） |
-
-> `DSH_WEB_HOST` / `DSH_WEB_PORT` 会被 `entrypoint.sh` 的就绪探测直接使用。
-> 若修改，请同步调整 `config/nginx/conf.d/dsh-proxy.conf` 中的 `proxy_pass` 目标。
-
-### 时区说明
-
-容器默认使用**北京时间（`Asia/Shanghai`）**，`date` 命令与 Nginx 日志时间戳
-（形如 `[14/Sep/2026:14:34:33 +0800]`）均为东八区时间。
-
-如需改用其他时区，两种方式：
-
-```bash
-# 方式一：临时覆盖（推荐）
-docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:v0.4.0
-
-# 方式二：修改 /dsh/profile.env 中的 TZ 后重启容器
-```
-
-`entrypoint.sh` 会自动同步 `/etc/localtime` 与 `/etc/timezone`，无需手动处理；
-若指定的时区在 `zoneinfo` 中不存在，会告警并沿用镜像默认时区。
-
-### 字符编码与中文显示
-
-镜像内置 `LANG=C.UTF-8`、`LC_ALL=C.UTF-8`，容器内查看含中文的脚本/日志时
-`less`、`grep` 等工具均可正常显示。
-
-> **如果早期版本（≤ v0.3.7）里 `less script/entrypoint.sh` 提示
-> `"may be a binary file. See it anyway?"` 且中文显示成 `<E5><8A><A0>` 之类：
-> 这不是脚本编码问题，脚本本身一直是干净的 UTF-8。**
->
-> 根因是 `debian:*-slim` 基础镜像**不设置任何 locale**，容器内 `LANG`/`LC_ALL` 为空，
-> glibc 回退到 POSIX/C locale（`LC_CTYPE="POSIX"`）。此时 `less` 按**单字节**处理文本，
-> 看到 UTF-8 的中文多字节序列就误判为二进制，并以 `cat -v` 风格逐字节转义输出。
->
-> 一句话辨别：`head -n 20 script/entrypoint.sh` 输出正常、但 `less` 报二进制
-> —— 问题在显示层的 locale，不在文件内容。
-
-若你的运行环境仍遇到该问题（例如镜像被 `-e LC_ALL=` 覆盖），在容器内临时修复：
-
-```bash
-export LANG=C.UTF-8 LC_ALL=C.UTF-8   # 或启动时加 -e LANG=C.UTF-8
-```
-
-`v0.3.8` 起镜像已同时内置 `less` 与 `file`（slim 镜像默认不含），
-方便进容器排查：`less /dsh/log/dsh/dsh-web.log`、`file /dsh/script/entrypoint.sh`。
-
-## 版本配置 (versions.yml)
-
-支持两种安装方式，可混用。解析器会**自动剥离行尾注释**，因此可以放心写中文注释：
-
-```yaml
-# 方式一：组件名 + 版本号
-dsh:
-  version: latest          # latest 或 "0.1.5-rc.1"，行尾注释会被忽略
-
-plugins:
-  - name: dsh-web-lan-access
-    version: latest
-    profile: web
-
-# 方式二：直接指定下载 URL（优先级高于 version）
-dsh:
-  url: https://registry.npmjs.com/@deepseek-ai/dsh/-/dsh-0.1.5-rc.1.tgz
-
-plugins:
-  - name: dsh-ctl
-    url: https://registry.npmjs.com/dsh-ctl/-/dsh-ctl-0.1.1.tgz
-    profile: web
-```
-
-> 插件安装在 `install-dsh.sh` / `entrypoint.sh` 中均**以 `dsh plugin list` 的实际结果为准**，
-> 而非命令退出码；未注册会自动重试最多 3 次。安装日志见 `/dsh/log/plugins/<插件名>.log`。
->
-> **npm scope 包名**：插件名需写完整包名（如 `@chengxianglibra/dsh-data-analysis`），
-> 不可省略 `@scope/` 前缀。日志文件名会把包名中的 `/` 等字符安全化为 `__`，
-> 因此该插件的日志为 `/dsh/log/plugins/__chengxianglibra__dsh-data-analysis.log`。
-
-### 内置插件列表
-
-| 插件 | 包名 | 说明 |
-|------|------|------|
-| `dsh-web-lan-access` | `dsh-web-lan-access` | 局域网访问支持 |
-| `dsh-ctl` | `dsh-ctl` | 进程控制与计划内重启，重启日志写入 `/dsh/log/plugins/dsh-ctl-relaunch.log` |
-| 数据分析 | `@chengxianglibra/dsh-data-analysis` | 基于 Marivo 的数据分析插件：自然语言分析指标趋势、连接数据源、生成图表／报告／看板，支持导出 HTML 离线阅读 |
-
-> 数据分析插件为社区插件（非 DeepSeek 官方发行），首次使用会自动准备分析环境并联网下载依赖。
-> 要求 DSH `>=0.1.5-rc.1`；镜像内置 Node.js 24 满足其 `^22.19.0 || >=24.0.0` 要求。
-
-## Nginx 配置
-
-| 路径 | 功能 |
-|------|------|
-| `/health` | Nginx stub_status 状态页面 |
-| `/` | 反向代理到 `127.0.0.1:3080`（DSH Web UI） |
-
-代理关键配置：
-- `Host: 127.0.0.1:3080` — 让 DSH 认为请求来自本地
-- `Origin: ""` — 清空 Origin 头，绕过跨站检查
-- WebSocket 支持 — 自动 Upgrade/Connection 头处理
-
-## 使用方法
-
-### 使用预构建镜像（推荐）
-
-无需本地构建，直接从 GitHub Container Registry 拉取：
+## 一条命令跑起来
 
 ```bash
 docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
@@ -337,209 +15,288 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
   ghcr.io/higkoo/dsh:latest
 ```
 
-**镜像标签说明**：
-
-| 标签 | 含义 | 适用场景 |
-|------|------|----------|
-| `latest` | 最新稳定版 | 日常使用 |
-| `v0.4.0` | 语义化版本，固定不变 | **生产环境推荐**，避免意外升级 |
-| `v0.4` | 次版本浮动标签，随补丁自动更新 | 跟随次版本线 |
-| `sha-<短提交>` | 对应具体提交 | 精确回溯 / 问题排查 |
-
-> 版本由 git tag 驱动：推送 `vX.Y.Z` 标签后 CI 自动构建，生成对应的
-> 版本号标签、`X.Y` 浮动标签与 `latest`。非 tag 推送（如分支合并）仅更新 `latest` 与 `sha-*`。
-
-**版本线说明**：`v0.4.0` 起进入**稳定维护**阶段，只做向后兼容的修复与打磨；
-`v0.1.*` / `v0.3.*` 系列已停止维护并从镜像仓库移除，请使用 `v0.4.0` 及以上版本。
-完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
-
-> 容器默认使用**北京时间（`Asia/Shanghai`）**，日志与 `date` 均为东八区时间。
-> 详细说明与修改方式见上文「[时区说明](#时区说明)」。
-
-### Docker 构建
-
-```bash
-git clone https://github.com/higkoo/dsh-docker.git
-cd dsh-docker
-docker build -t dsh .
-docker run -d --name dsh-web -p 9080:80 -p 9443:443 dsh
-```
-
-### Ansible 部署
-
-```bash
-cd ansible
-ansible-playbook -i inventory.ini playbook.yml
-```
-
-Playbook 默认映射 `9080:80` 与 `9443:443`，与上面的 `docker run` 保持一致，
-可在 `playbook.yml` 的 `host_http_port` / `host_https_port` 中调整。
-
-### 访问
-
-- DSH Web UI: `http://<服务器IP>:9080/?token=<token>`（token 在容器启动日志中输出）
-- HTTPS: `https://<服务器IP>:9443/?token=<token>`（自签证书，浏览器需手动信任）
-- 健康检查: `http://<服务器IP>:9080/health`
-
-查看 token（容器启动后，或**用 `dshctl` 重启之后**都可用）：
-
-```bash
-docker logs dsh-web 2>&1 | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
-```
-
-也可以直接读日志文件，二者内容一致：
-
-```bash
-# 容器内，任选其一（tail -1 取最后一个 = 当前有效的 token）
-cat /dsh/log/dsh/dsh-web.log               | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
-cat /dsh/log/plugins/dsh-ctl-relaunch.log  | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
-```
-
-> **关于 `dshctl` 重启后的 token**：`dshctl` 会在进程外重新拉起 DSH，
-> 新进程的输出由插件写入自己的接力日志 `dsh-ctl-relaunch.log`。
-> 该文件（含重启后的新 token）已统一归位到 `/dsh/log/plugins/` 下，
-> 便于集中查看；日志会**追加**而非覆盖，旧 token 记录保留，
-> 用 `tail -1` 取最后一个即为当前有效 token。
->
-> **容器会自动播报新 token（v0.4.0 起）**：重启后 DSH 会生成**新 token**，
-> 看护循环检测到 PID 变化时会从日志重新解析，并打印
->
-> ```
->   [看护] DSH 已由外部重启，实际 PID: 1234 -> 5678
->   ============================================================
->     [看护] DSH 已重启，token 已更新，新访问地址:
->       HTTP : http://<你的IP>:9080/?token=<新 token>
->       HTTPS: https://<你的IP>:9443/?token=<新 token>
->       容器内直连: http://127.0.0.1:3080/?token=<新 token>
->       LAN 访问: http://<容器IP>:3080/?token=<新 token>
->       健康检查页面: http://<你的IP>:9080/health
->   ============================================================
-> ```
->
-> 因此**无需手动去翻日志**，`docker logs` 里就能拿到最新地址。
-> 该播报只在 token **确实变化**时触发，不会每次轮询都刷屏。
-
-### 日志查看
-
-容器前台会跟踪 `/dsh/log/*/*.log` 下的**全部日志**，即 `docker logs` 里
-能看到 `dsh`、`nginx`、`plugins` 各子目录的所有日志，新日志文件出现后
-无需改配置即可被跟踪：
+等十几秒，看日志：
 
 ```bash
 docker logs -f dsh-web
 ```
 
-进入容器查看完整日志树：
-
-```bash
-docker exec dsh-web sh -c 'ls -R /dsh/log'
-```
-
-### 启动流程与状态
-
-容器启动全程按固定阶段输出，便于判断「现在在干什么、是否卡住」：
+看到下面这段就说明好了，**HTTP 那一行就是你要访问的地址**（token 必须带，否则 401）：
 
 ```
-============================================================
-  DSH Docker 容器
-  镜像版本: v0.4.0
-  启动时间: 2026-09-16 11:40:00
-  根目录  : /dsh
-  提示：DSH 首次启动需初始化插件（通常 10~40s），就绪以日志出现
-        'dsh web:' 行为准，届时会打印访问地址。
-============================================================
-[1/6] DSH 已安装: 0.1.5-rc.1
-[2/6] 生成自签证书...
-[3/6] 启动 Nginx 反向代理 (port 80/443)...
-       Nginx 健康检查通过
-[4/6] 启动 DSH Web UI（首次启动需初始化插件，请耐心等待）...
-  [dsh] 正在加载插件 dsh-web-lan-access ...
-  [dsh] 正在加载插件 dsh-ctl ...
-  DSH 启动中... 5s（插件初始化中，超过 120s 后转为低频提示）
-  DSH 启动中... 15s（插件初始化中，超过 120s 后转为低频提示）
-  DSH 已就绪（18s，插件树加载完成）
-  LAN 插件已生效: http://172.24.0.24:3080/?token=<token>
 ============================================================
   [5/6] DSH 已就绪，请访问:
-    HTTP : http://<你的IP>:9080/?token=<token>
-    HTTPS: https://<你的IP>:9443/?token=<token>
-  容器内直连: http://127.0.0.1:3080/?token=<token>
-  LAN 访问: http://172.24.0.24:3080/?token=<token>
+    HTTP : http://<你的IP>:9080/?token=xxxxxxxx
+    HTTPS: https://<你的IP>:9443/?token=xxxxxxxx
+  容器内直连: http://127.0.0.1:3080/?token=xxxxxxxx
+  LAN 访问: http://172.24.0.24:3080/?token=xxxxxxxx
   健康检查页面: http://<你的IP>:9080/health
 ============================================================
 ```
 
-> 首屏横幅只打印容器信息与提示，**不再预先列出 6 个步骤** ——
-> 各步骤在真正执行到时会各自打印一次 `[N/6]`，预先列一遍属于重复播报。
+把 `<你的IP>` 换成服务器 IP 即可。HTTPS 是自签证书，浏览器需要手动信任一次。
 
-**两条输出线，互为补充**：
+> **首次启动慢是正常的。** 内置的数据分析插件要现场建 Python 环境并装依赖，实测可能
+> 1~3 分钟。日志里每 10 秒会打一次心跳，只要还在打心跳就是在正常初始化，别急着 kill。
 
-- `  [dsh] ...` —— DSH 自身日志的**实时转发**（启动期挂 `tail -F`）。
-  插件加载到哪一步、报了什么都直接可见；
-- `  DSH 启动中... Ns` —— 主流程的**等待心跳**（每 10s 一次）。
-  即使 DSH 某个阶段长时间静默，也有心跳证明「脚本还在等，没卡死」。
+<details>
+<summary><b>没有 Docker 或者想从源码构建？</b></summary>
 
-**就绪判定的三条规则**（取代早期「固定等 N 秒 + 盲目重启」）：
+```bash
+git clone https://github.com/higkoo/dsh-docker.git
+cd dsh-docker
+docker build -t dsh .          # 默认 apt 模式，约 550 MB
+docker run -d --name dsh-web -p 9080:80 -p 9443:443 dsh
+```
 
-| 信号 | 含义 | 行为 |
+用 Ansible 批量部署：
+
+```bash
+cd ansible
+ansible-playbook -i inventory.ini playbook.yml   # 默认映射 9080:80 / 9443:443
+```
+
+</details>
+
+---
+
+## 怎么访问
+
+| 入口 | 地址 | 说明 |
 |------|------|------|
-| 日志出现 `dsh web: http...` | 插件树**全部加载成功**，token 已在该行 | 立即成功，**绝不重启** |
-| DSH 进程已退出 | 真崩溃（如插件报错） | 秒级识别，重试（最多 3 轮） |
-| 进程存活但长时间无进展 | 慢启动（插件正在建 venv / 装依赖） | 打印进度 + 日志尾部，**持续等待，不判失败** |
+| Web UI | `http://<IP>:9080/?token=<token>` | 日常使用 |
+| Web UI (HTTPS) | `https://<IP>:9443/?token=<token>` | 自签证书，需信任一次 |
+| 健康检查 | `http://<IP>:9080/health` | Nginx 状态页，无需 token |
 
-> **核心原则：慢 ≠ 坏。** 只要 DSH 进程还活着，就认定「仍在初始化」并继续等待。
-> `dsh-data-analysis` 首次启动要建 venv、装 `marivo`/`pandas`，实测可能耗时
-> **1~3 分钟**；把这种健康但慢的进程判死、或 kill 掉重启，才是真正的问题
-> （会白白作废已下载的依赖，越重启越慢）。
->
-> 因此这里用的是**事件**判据（就绪行 / 进程退出），而非**时长**判据。
-> 相关环境变量（均已写入 `/dsh/profile.env`，可直接编辑或 `-e` 覆盖）：
->
-> | 变量 | 默认 | 作用 |
-> |------|------|------|
-> | `DSH_READY_TIMEOUT` | `120` | **软上限**：仅控制提示频率。120s 内每 10s 打一次进度；超过后改为每 30s 打一次并附日志尾部。**不触发失败**。 |
-> | `DSH_READY_HARD_TIMEOUT` | `0` | **硬上限**：`0` = 不限（推荐）。设为正数（如 `600`）则在超过该秒数后放弃，适用于不允许容器长期处于启动态的场景。 |
-> | `DSH_DOWN_GRACE` | `90` | 运行期服务不可达的容忍窗口（秒）。`dshctl` 重启的交接期约 45s，超过该值才判定为故障。 |
->
-> 例：`-e DSH_READY_HARD_TIMEOUT=600` 表示最多等 10 分钟；不设则一直等到就绪或进程退出。
->
-> **为什么不能只 `curl` 端口**：容器内 80/443 由 Nginx 监听，Nginx 一起来端口就通，
-> 哪怕后端 DSH 已经崩溃退出。早期实现据此报「已就绪」是假阳性 —— 正确的就绪信号
-> 是日志里的 `dsh web:` 行（`dsh-web-app` 在 boot 成功后才打印，且天然携带 token）。
+### token 丢了怎么办
 
-**启动失败时容器会 `exit 1`**（而非假装 running），并打印最近日志，便于编排系统
-（`--restart`、K8s）感知并拉起；常见原因是容器无法访问 npm registry。
+token 每次启动都是新生成的，**取最后一条就是当前有效的**：
 
-### 容器自愈
+```bash
+# 从容器日志拿
+docker logs dsh-web 2>&1 | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
+```
 
-容器内置**服务级**看护：
+### 用 dshctl 重启之后为什么地址变了
 
-- DSH 或 Nginx **意外退出**时，容器会一并退出；
-  配合 `--restart unless-stopped`（上面的示例已包含）即可实现故障自动恢复。
-- 通过 `dshctl` 执行的**计划内重启**（`/dshctl/restart`）不会被误判为崩溃：
-  看护以 **HTTP 服务可用性** 为准，并给出 90 秒交接宽限窗口，
-  重启完成后自动识别新进程 PID，容器持续运行。
-- 观察窗口内的状态提示会区分「进程仍在但无响应」与「进程已退出、等待重启交接」。
+`dshctl`（界面里的计划内重启）会拉起一个**新进程**，token 自然是新的。
+不用你翻日志 —— 容器会**自动播报新地址**：
+
+```
+  [看护] DSH 已由外部重启，实际 PID: 1234 -> 5678
+    [看护] DSH 已重启，token 已更新，新访问地址:
+      HTTP : http://<你的IP>:9080/?token=<新 token>
+      ...
+```
+
+该播报只在 token **确实变化**时触发，不会刷屏。想手动确认就还是那句 `tail -1`。
+
+---
+
+## 常用配置
+
+### 环境变量
+
+集中放在 `/dsh/profile.env`，改完重启容器生效；也可以用 `docker run -e` 临时覆盖。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `TZ` | `Asia/Shanghai` | 容器时区 |
+| `DSH_HOME` | `/dsh/home` | DSH 数据目录（profile、插件数据） |
+| `DSH_WEB_PORT` | `3080` | DSH Web UI 监听端口（改完要同步改 Nginx 配置） |
+| `DSH_HTTP_PORT` / `DSH_HTTPS_PORT` | `9080` / `9443` | **仅影响启动提示的显示**，真实端口以 `-p` 为准 |
+| `DSH_READY_TIMEOUT` / `DSH_READY_HARD_TIMEOUT` / `DSH_DOWN_GRACE` | `120` / `0` / `90` | 就绪等待与故障容忍窗口，一般不用动 |
+
+完整清单见 [`profile.env`](profile.env)。
+
+### 换时区
+
+```bash
+docker run -d ... -e TZ=Asia/Tokyo ghcr.io/higkoo/dsh:latest
+```
+
+### 版本与插件
+
+DSH 本体和插件装哪个版本，由 `config/dsh/versions.yml` 决定，支持「包名 + 版本号」
+和「直接给下载 URL」两种写法，可混用：
+
+```yaml
+dsh:
+  version: latest                    # 也可以写死 "0.1.5-rc.1"
+
+plugins:
+  - name: dsh-web-lan-access
+    version: latest
+    profile: web
+```
+
+镜像内置三个插件：
+
+| 插件 | 作用 |
+|------|------|
+| `dsh-web-lan-access` | 局域网访问支持 |
+| `dsh-ctl` | 进程控制、界面里的计划内重启 |
+| `@chengxianglibra/dsh-data-analysis` | 数据分析（社区插件）：自然语言查指标、连数据源、出图表/报告，可导出 HTML |
+
+> 插件是否装好，以 `dsh plugin list` 的实际结果为准（不是命令退出码），失败会自动重试 3 次。
+> 单个插件的安装日志在 `/dsh/log/plugins/<插件名>.log`。
+
+### 换 Python 安装方式（构建参数 `PYTHON_MODE`）
+
+| 模式 | 版本 | 镜像体积 | 说明 |
+|------|------|---------|------|
+| `apt`（默认） | 3.13.5 | 约 550 MB | 装发行版自带，秒级完成 |
+| `source` | 3.14.7 | 约 1.08 GB | 源码编译，amd64 约 4.5 分钟 |
+| `none` | — | 约 417 MB | **不装 Python，数据分析插件会加载失败** |
+
+```bash
+docker build --build-arg PYTHON_MODE=source -t dsh .
+```
+
+> **为什么默认要装 Python**：DSH 本体不依赖 Python，但内置的数据分析插件强依赖它
+> （要 Python ≥ 3.10 且带 venv/ensurepip）。没有 Python 时插件会加载失败，
+> 进而拖垮整棵插件树、DSH 进程直接退出 —— 现象是「起不来、拿不到 token」。
+> 原理详见 [docs/DESIGN.md](docs/DESIGN.md#6-python-与内置插件的依赖关系)。
+
+### 支持的平台
+
+同一标签同时提供 `linux/amd64` 与 `linux/arm64`，Docker 会自动挑选匹配的版本，无需手动指定。
+其它架构（`386`、`riscv64` 等）不支持。
+
+---
+
+## 出问题怎么办
+
+### 先看这三个地方
+
+```bash
+docker logs dsh-web                    # 前台跟踪了全部日志，先看这个
+docker exec dsh-web ls -R /dsh/log     # 完整日志树
+docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
+```
+
+日志按来源分目录存放，找问题直接去对应目录：
+
+| 目录 | 内容 |
+|------|------|
+| `/dsh/log/dsh/` | DSH 本体运行日志、安装日志 |
+| `/dsh/log/nginx/` | 访问日志、错误日志 |
+| `/dsh/log/plugins/` | 各插件自己的日志（含 `dshctl` 重启的接力日志） |
+
+### 常见现象对照
+
+| 现象 | 大概率原因 | 怎么办 |
+|------|-----------|--------|
+| 一直「DSH 启动中...」 | 数据分析插件在建 venv、装依赖，正常 | 等 1~3 分钟，心跳还在就别动它 |
+| 容器 `exit 1` 退出 | 就绪超时，通常是**容器连不上 npm registry** | 检查网络/代理；日志末尾会打印原因 |
+| 日志里一堆 Node 崩溃栈，提到 `plugin tree failed to load` | 某个插件加载失败（如 `none` 模式下缺 Python） | 用默认 `apt` 模式重构建 |
+| 访问 401 / 页面空白 | token 不对或没带 | 用 `tail -1` 重新取；`dshctl` 重启后 token 会变 |
+| `less` 看中文日志显示 `<E5><8A><A0>` | 是旧镜像（≤ v0.3.7）缺 locale，不是文件坏了 | 升级到 v0.4.0+；临时 `export LC_ALL=C.UTF-8` |
+| 服务起来了但界面打不开 | 端口没映射对 | 确认 `docker run -p` 与 `config/nginx/conf.d/dsh-proxy.conf` |
+
+### 容器会自动重启吗
+
+会。容器内置**服务级看护**：DSH 或 Nginx **真挂了**时容器会一并退出，
+配合上面 `docker run` 里的 `--restart unless-stopped` 就会自动拉起。
+
+而 `dshctl` 那种**计划内重启不会被误判** —— 看护以 HTTP 可用性为准，并留了 90 秒交接窗口。
+
+> 看不出来「真挂」和「计划内重启」的区别？想搞懂判定逻辑，见
+> [docs/DESIGN.md](docs/DESIGN.md#4-进程看护为什么用-http-可用性而不是-pid)。
+
+---
+
+## 镜像标签怎么选
+
+| 标签 | 含义 | 场景 |
+|------|------|------|
+| `latest` | 最新稳定版 | 日常使用 |
+| `v0.4.1` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
+| `v0.4` | 次版本浮动，随补丁更新 | 跟随次版本线 |
+| `sha-<短提交>` | 对应具体提交 | 精确回溯 |
+
+推送 `vX.Y.Z` 标签后 CI 自动构建并产出上述标签；普通分支推送只更新 `latest` 与 `sha-*`。
+完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## 目录结构一瞥
+
+```
+/dsh/
+├── app/          # 绿色安装的 Node.js / Python
+├── config/       # nginx、dsh(versions.yml)、ansible 配置
+├── log/          # 日志（dsh / nginx / plugins 分类）
+├── home/         # DSH 数据目录
+├── workspace/    # DSH 工作区
+├── script/       # entrypoint.sh、install-dsh.sh
+└── profile.env   # 环境变量
+```
+
+<details>
+<summary><b>展开完整目录树（含每个文件的作用）</b></summary>
+
+```
+/dsh/
+├── app/                         # 应用程序安装目录（绿色安装）
+│   ├── nodejs/                  # Node.js 24（预编译二进制）
+│   │   ├── bin/                 # node, npm, npx, pnpm
+│   │   └── lib/                 # 全局 npm 包
+│   └── python/                  # Python（PYTHON_MODE 控制，默认 apt）
+│       ├── bin/                 # python3, pip3      ← none 模式时不存在
+│       ├── lib/                 # 仅 source 模式：标准库 + 共享库
+│       └── venv/                # Python 虚拟环境
+│
+├── profile.env                  # 环境变量配置
+│
+├── config/
+│   ├── nginx/
+│   │   ├── nginx.conf           # 主配置
+│   │   ├── conf.d/dsh-proxy.conf# DSH 反代 + 健康检查
+│   │   └── ssl/                 # 自签证书（首次启动生成）
+│   ├── dsh/versions.yml         # DSH 及插件版本配置
+│   └── ansible/                 # playbook.yml、inventory.ini
+│
+├── log/
+│   ├── nginx/                   # access.log、error.log
+│   ├── dsh/                     # dsh-web.log、install.log
+│   └── plugins/                 # 各插件日志（包名 '/' 安全化为 '__'）
+│
+├── run/                         # nginx.pid、dsh.pid
+├── workspace/                   # DSH 工作区
+├── home/profiles/               # 插件 profile 目录
+└── script/
+    ├── entrypoint.sh            # 容器启动入口
+    └── install-dsh.sh           # DSH 及插件安装脚本
+```
+
+> Nginx 二进制由 apt 安装（`/usr/sbin/nginx`），但配置与日志已通过软链接指向 `/dsh/`：
+> `/etc/nginx/nginx.conf` → `/dsh/config/nginx/nginx.conf`，
+> `/etc/nginx/conf.d` → `/dsh/config/nginx/conf.d`，
+> `/var/log/nginx` → `/dsh/log/nginx`。
+
+</details>
+
+---
+
+## 想了解更多
+
+README 只讲「怎么用」。**为什么这么设计、踩过哪些坑**，都在
+[docs/DESIGN.md](docs/DESIGN.md)：就绪判定为何用事件而非时长、看护为何看 HTTP 而非 PID、
+token 的生命周期、Python 与插件的依赖关系、apt/source 两种模式的目录对齐等。
 
 ## 开发
 
-### 运行测试
-
 ```bash
-bash test/test_versions_parser.sh
+bash test/test_versions_parser.sh    # versions.yml 解析器边界测试（CI 同步执行）
 ```
 
-覆盖 `versions.yml` 解析器的边界场景（行尾注释、引号、含 `#` 的 URL、多插件、
-`set -e` 中断回归等），CI 中同步执行。
-
-### 发布新版本
+发布新版本：
 
 ```bash
-git tag -a v0.4.0 -m "v0.4.0: 变更说明"
-git push origin v0.4.0
+git tag -a v0.4.1 -m "v0.4.1: 变更说明"
+git push origin v0.4.1               # CI 自动 lint → 构建 → 推送镜像
 ```
-
-推送后 CI 自动 lint → 构建 → 推送镜像，产出 `v0.4.0`、`v0.4`、`latest` 与 `sha-*` 标签。
 
 ## License
 
