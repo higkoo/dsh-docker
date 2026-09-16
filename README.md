@@ -9,17 +9,21 @@
 
 ## 一条命令跑起来
 
+最省事的写法 —— 拉镜像、起容器、跟日志，一行搞定：
+
+```bash
+docker pull ghcr.io/higkoo/dsh:latest && docker run -d -p 9080:80 -p 9443:443 --name dsh-web ghcr.io/higkoo/dsh:latest && docker logs -f dsh-web
+```
+
+想看完整参数（主机名、自动重启策略等），用这个：
+
 ```bash
 docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
   -p 9080:80 -p 9443:443 \
   ghcr.io/higkoo/dsh:latest
 ```
 
-等十几秒，看日志：
-
-```bash
-docker logs -f dsh-web
-```
+> 上面用的都是**本项目 CI 构建并发布到 GHCR 的官方镜像**，直接可用，无需自己构建。
 
 看到下面这段就说明好了，**HTTP 那一行就是你要访问的地址**（token 必须带，否则 401）：
 
@@ -36,8 +40,9 @@ docker logs -f dsh-web
 
 把 `<你的IP>` 换成服务器 IP 即可。HTTPS 是自签证书，浏览器需要手动信任一次。
 
-> **首次启动慢是正常的。** 内置的数据分析插件要现场建 Python 环境并装依赖，实测可能
-> 1~3 分钟。日志里每 10 秒会打一次心跳，只要还在打心跳就是在正常初始化，别急着 kill。
+> **首次启动慢是正常的。** 内置的数据分析插件要现场建 Python 环境并装依赖，
+> 实测可能要 **5~10 分钟**（网络慢时更久）。日志里每 10 秒会打一次心跳，
+> 只要还在打心跳就是在正常初始化，别急着 kill。
 
 <details>
 <summary><b>没有 Docker 或者想从源码构建？</b></summary>
@@ -196,7 +201,7 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 
 | 现象 | 大概率原因 | 怎么办 |
 |------|-----------|--------|
-| 一直「DSH 启动中...」 | 数据分析插件在建 venv、装依赖，正常 | 等 1~3 分钟，心跳还在就别动它 |
+| 一直「DSH 启动中...」 | 数据分析插件在建 venv、装依赖，正常 | 等 5~10 分钟，心跳还在就别动它 |
 | 日志停在「dsh web 启动 #1」不动 | DSH 正在装插件的重依赖，中间不写日志属正常 | 看 `[18:12:17] ==> install.log <==` 段是否在刷 |
 | 容器 `exit 1` 退出 | 就绪超时，通常是**容器连不上 npm registry** | 检查网络/代理；日志末尾会打印原因 |
 | 日志里一堆 Node 崩溃栈，提到 `plugin tree failed to load` | 某个插件加载失败（如 `none` 模式下缺 Python） | 用默认 `apt` 模式重构建 |
