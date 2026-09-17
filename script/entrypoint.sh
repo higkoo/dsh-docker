@@ -91,8 +91,6 @@ sync_dsh_log_alias() {
 
 # DSH 启动次数计数器，仅用于日志分隔标记
 DSH_START_COUNT=0
-# [4/6] 启动期的日志转发进程 PID（[6/6] 前要停掉，改由整合 tail 接管）
-DSH_FOLLOW_PID=""
 DSH_PID=""
 
 # 启动前自检：日志文件不可写就直接报错，避免「默默写不进去、事后才发现」
@@ -126,8 +124,14 @@ cleanup_stale_pid() {
 start_dsh() {
     if [ -n "$DSH_PID" ] && kill -0 "$DSH_PID" 2>/dev/null; then
         kill "$DSH_PID" 2>/dev/null || true
-        wait "$DSH_PID" 2>/dev/null || true
-        sleep 1
+        # ⚠ 不用 `wait "$DSH_PID"`：dsh 是 pnpm 包装壳，kill 掉壳后子进程可能
+        #   仍存活，wait 会一直等下去（同 stop_dsh_log_follow 的坑）。
+        #   改为限时轮询，最多等 5s；超时就放过，交给后续逻辑处理。
+        local i=0
+        while [ "$i" -lt 50 ] && kill -0 "$DSH_PID" 2>/dev/null; do
+            sleep 0.1
+            i=$((i + 1))
+        done
     fi
 
     # 不清空 $DSH_LOG：token 解析靠「取日志最后一条」，截断会抹掉历史记录。
@@ -150,24 +154,114 @@ start_dsh() {
     DSH_PID=$!
     echo "$DSH_PID" > "${RUN_DIR}/dsh.pid"
 
-    # 启动期实时转发日志到终端（带 [dsh] 前缀，让插件加载进度可见）。
-    # 前缀只加在转发流上，不污染文件，解析不受影响。
-    if [ -n "$DSH_FOLLOW_PID" ] && kill -0 "$DSH_FOLLOW_PID" 2>/dev/null; then
-        kill "$DSH_FOLLOW_PID" 2>/dev/null || true
-    fi
-    tail -F -n +1 "$DSH_LOG" 2>/dev/null | sed -u 's/^/  [dsh] /' | grep --line-buffered '' &
-    DSH_FOLLOW_PID=$!
+    # 启动期实时转发日志到终端，让插件加载进度可见。
+    # 覆盖 /dsh/log/*/*.log 全部文件 —— 启动阶段 nginx / 插件日志同样值得看，
+    # 早先只跟 $DSH_LOG 一个文件时，用户会以为「日志没刷新」。详见 docs/DESIGN.md。
+    start_log_follow
 }
 
-# 停止 [4/6] 的日志转发，交给 [6/6] 的整合 tail 继续，避免重复打印
-stop_dsh_log_follow() {
-    if [ -n "$DSH_FOLLOW_PID" ] && kill -0 "$DSH_FOLLOW_PID" 2>/dev/null; then
-        # 先 kill 管道尾端的 grep，再 kill tail，确保管道被彻底拆掉
-        pkill -P "$DSH_FOLLOW_PID" 2>/dev/null || true
-        kill "$DSH_FOLLOW_PID" 2>/dev/null || true
-        wait "$DSH_FOLLOW_PID" 2>/dev/null || true
+# ============================================================
+# 日志转发到终端（docker logs）
+#
+# 设计要点（每一条都是踩过的坑）：
+#   1. 覆盖 /dsh/log/*/*.log **全部**文件，而不是只跟 dsh-web.log；
+#   2. 每行加 [HH:MM:SS] 时间戳，多文件混排时能看出「什么时候发生的」；
+#      —— 用 bash 内建 printf '%()T'，零 fork；awk 的 strftime 在 slim 镜像里
+#         不一定可用，实测 mawk 上静默不输出，故不用；
+#   3. 周期性重扫 glob：运行中**新建**的日志文件（新装插件）也能自动被纳入。
+#      tail 只认启动时给的参数，光靠 -F 是补不上新文件的；
+#   4. 全程不用 wait（见 stop_dsh_log_follow 的注释）。
+#
+# 进程结构：
+#   _log_tail_supervisor（后台，持有 tail） ── tail -F <文件...>
+#                                          └─ while read 加时间戳 → 终端
+#   LOG_TAIL_PID 记 supervisor，LOG_FILES_BAK 记本轮跟踪的文件快照
+# ============================================================
+LOG_TAIL_PID=""
+LOG_FILES_SNAPSHOT=""
+
+# 收集当前所有日志文件（按路径排序，保证不同轮次可比）
+collect_log_files() {
+    local -a found=()
+    shopt -s nullglob
+    found=("${DSH_ROOT}"/log/*/*.log)
+    shopt -u nullglob
+    if [ "${#found[@]}" -eq 0 ]; then
+        found=("${NGINX_LOG_DIR}/access.log" "${NGINX_LOG_DIR}/error.log" "$DSH_LOG")
     fi
-    DSH_FOLLOW_PID=""
+    printf '%s\n' "${found[@]}"
+}
+
+# 启动（或重启）日志转发。重复调用会先停掉旧的，避免出两份。
+start_log_follow() {
+    stop_log_follow
+    # 把「监视文件集合 + tail + 时间戳」整体放进一个 supervisor 子 shell，
+    # 这样重扫发现新文件时，内部重启 tail 不会影响主脚本。
+    (
+        local -a files=()
+        mapfile -t files < <(collect_log_files)
+        tail -F "${files[@]}" 2>/dev/null | while IFS= read -r line; do
+            [ -z "$line" ] && continue                       # 丢掉空行/分隔头空行
+            printf '[%(%H:%M:%S)T] %s\n' -1 "$line"          # 内建格式化，零 fork
+        done
+    ) &
+    LOG_TAIL_PID=$!
+    LOG_FILES_SNAPSHOT="$(collect_log_files | tr '\n' ' ')"
+}
+
+# 日志文件集合是否变化（有新建/删除）
+log_files_changed() {
+    local now
+    now="$(collect_log_files | tr '\n' ' ')"
+    [ "$now" != "$LOG_FILES_SNAPSHOT" ]
+}
+
+stop_log_follow() {
+    [ -n "$LOG_TAIL_PID" ] || return 0
+    # ⚠ 顺序很关键：**先**把子孙全列出来，**再** kill。
+    #   supervisor 是子 shell，tail / while 都是它的子孙；一旦先 kill 掉它，
+    #   子孙会被 reparent 到 PID 1，PPID 链就断了，再也找不到它们 → 孤儿堆积。
+    local -a victims=("$LOG_TAIL_PID")
+    local pid
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && victims+=("$pid")
+    done < <(collect_tail_children "$LOG_TAIL_PID")
+    for pid in "${victims[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    LOG_TAIL_PID=""
+    LOG_FILES_SNAPSHOT=""
+}
+
+# 列出以 $1 为祖先的所有进程 PID（含 tail / 子 shell），用于精确清理。
+# 容器内无 pkill / ps，只能靠 /proc 的 PPid 关系逐层找。
+collect_tail_children() {
+    local root="$1" p pid ppid depth
+    [ -z "$root" ] && return 0
+    local -a frontier=("$root")
+    while [ "${#frontier[@]}" -gt 0 ]; do
+        local -a next=()
+        for p in "${frontier[@]}"; do
+            for pid in $(collect_pids_by_ppid "$p"); do
+                echo "$pid"
+                next+=("$pid")
+            done
+        done
+        frontier=("${next[@]}")
+        depth=$((depth + 1))
+        [ "$depth" -gt 10 ] && break   # 防意外死循环
+    done
+}
+
+# 列出所有「父进程 == $1」的 PID
+collect_pids_by_ppid() {
+    local want="$1" p pid ppid
+    for p in /proc/[0-9]*; do
+        pid="${p#/proc/}"
+        [ "$pid" = "$$" ] && continue
+        ppid="$(awk '/^PPid:/{print $2}' "$p/status" 2>/dev/null)" || continue
+        [ "$ppid" = "$want" ] && echo "$pid"
+    done
 }
 
 # ------------------------------------------------------------
@@ -501,25 +595,11 @@ fi
 #    无需改脚本即可被看到。
 # ============================================================
 echo "[6/6] 开始跟踪日志 ($DSH_ROOT/log/*/*.log)..."
-stop_dsh_log_follow
-# nullglob：无匹配时数组为空，避免把字面量通配符传给 tail
-shopt -s nullglob
-LOG_FILES=("${DSH_ROOT}"/log/*/*.log)
-shopt -u nullglob
-if [ "${#LOG_FILES[@]}" -eq 0 ]; then
-    LOG_FILES=(
-        "${NGINX_LOG_DIR}/access.log"
-        "${NGINX_LOG_DIR}/error.log"
-        "$DSH_LOG"
-    )
-fi
-
-tail -F "${LOG_FILES[@]}" 2>/dev/null &
-TAIL_PID=$!
+# 交棒给统一的转发器：覆盖全部日志文件 + 时间戳 + 自动纳入新建文件。
+start_log_follow
 
 cleanup() {
-    stop_dsh_log_follow
-    kill "$TAIL_PID" 2>/dev/null || true
+    stop_log_follow
 }
 trap cleanup EXIT
 
@@ -567,6 +647,13 @@ resolve_dsh_pid_by_port() {
 
 while true; do
     sleep 10
+
+    # 有新日志文件出现（例如运行中装了插件）就重启转发，把新文件纳入。
+    # tail 只认启动时给的参数，-F 也补不上后出现的文件，只能整体重启。
+    if log_files_changed; then
+        echo "  [日志] 检测到日志文件变化，重新跟踪 ($DSH_ROOT/log/*/*.log)"
+        start_log_follow
+    fi
 
     if dsh_service_alive; then
         DSH_DOWN_SINCE=0
