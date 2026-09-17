@@ -230,14 +230,59 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 [18:12:17] 10.88.7.123 - - [16/Sep/2026:18:12:17 +0800] "GET / HTTP/1.1" 401 79 "-" "Mozilla/5.0 ..." hop=172.17.0.1 xff="10.88.7.123, 10.0.2.100"
 ```
 
-访问日志**第 1 列就是来访者的真实 IP** —— 即使 DSH 跑在网关 / LB / 端口映射
-后面（由 Nginx 的 `realip` 模块从 `X-Forwarded-For` 解析），定位问题不用再猜：
-
 | 字段 | 含义 |
 |------|------|
-| 第 1 列 | **真实客户端 IP** |
-| `hop=` | 直连 Nginx 的那一跳（Docker 网关 / 容器自身 / 某台代理） |
-| `xff=` | 完整 XFF 链，多层代理时能看出请求经过哪些跳 |
+| 第 1 列 | 客户端 IP（有 XFF 时是**真实客户端**，否则是最后一跳） |
+| `hop=` | 直连 Nginx 的那一跳（网关 / 容器自身 / 某台代理） |
+| `xff=` | 完整 `X-Forwarded-For` 链，多层代理时能看出经过哪些跳 |
+
+### 访问日志里的客户端 IP
+
+日志第 1 列是 `$remote_addr`。容器内 Nginx 已启用 `realip` 模块，
+**当上游在 `X-Forwarded-For` 里写了真实 IP 时**，这一列会被改写为真实客户端 IP。
+
+但要注意：**realip 只能「解析」已存在的 XFF，自己不会推断来源**。
+能不能看到真实 IP，取决于你的部署形态：
+
+| 部署形态 | 第 1 列 | 说明 |
+|---------|---------|------|
+| **前面有 HTTP 代理 / 网关 / LB** | ✅ 真实 IP | 上游写了 XFF，realip 正常解析。这是本功能的目标场景 |
+| **Docker `-p` 端口映射** | ⚠️ 网关 IP | 端口映射是 L4 转发，**不加任何 HTTP 头**，XFF 为空 |
+| **Podman rootless（`slirp4netns`）** | ⚠️ `10.0.2.100` | 用户态网络栈，**真实来源在进入容器前就丢了**，无解 |
+| **`--network host`** | ✅ 真实 IP | 容器直接用宿主机网络栈，`$remote_addr` 就是真实地址 |
+| **Podman `--network pasta`** | ✅ 真实 IP | slirp4netns 的继任者，保留源 IP（Podman ≥ 4.4） |
+
+**怎么判断自己属于哪种**：看日志的 `xff=` 字段。
+
+```
+10.0.2.100 - - [...] "GET / HTTP/1.1" 200 22467 "..." "..." hop=10.0.2.100 xff="-"
+                                                    ↑                ↑
+                                            与第1列相同        xff 为空
+```
+
+`xff="-"` 表示**没有任何东西写 X-Forwarded-For**，此时 realip 无事可做，
+第 1 列与 `hop=` 必然相同 —— 这不是配置错误，是链路上没人提供这个信息。
+
+**想拿到真实 IP，按场景选择**：
+
+```bash
+# ① 有公司统一网关/LB 转发过来的：在那一层加一行即可
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+# ② Podman rootless：改用 pasta（Podman ≥ 4.4，最干净）
+podman run -d --name dsh-web --network pasta -p 9080:80 -p 9443:443 ghcr.io/higkoo/dsh:v0.4.4
+
+# ③ 或者用 host 网络（注意 host 模式下 -p 无效，用环境变量改监听端口）
+docker run -d --name dsh-web --network host \
+  -e DSH_HTTP_PORT=9080 -e DSH_HTTPS_PORT=9443 \
+  ghcr.io/higkoo/dsh:v0.4.4
+```
+
+> host / pasta 模式下 `$remote_addr` **直接就是真实 IP**，不依赖 XFF，
+> 所以日志里 `xff="-"` 是正常的。
+>
+> 用 host 或 pasta 时，若仍想保留网关 IP 用于排查，可把
+> `set_real_ip_from` 收敛为实际代理网段（公网部署建议这么做，防 XFF 伪造）。
 
 日志按来源分目录存放，找问题直接去对应目录：
 
@@ -259,6 +304,7 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 | 访问 401 / 页面空白 | token 不对或没带 | 用 `tail -1` 重新取；`dshctl` 重启后 token 会变 |
 | `less` 看中文日志显示 `<E5><8A><A0>` | 是旧镜像（≤ v0.3.7）缺 locale，不是文件坏了 | 升级到 v0.4.0+；临时 `export LC_ALL=C.UTF-8` |
 | 服务起来了但界面打不开 | 端口没映射对 | 确认 `docker run -p` 与 `config/nginx/conf.d/dsh-proxy.conf` |
+| 访问日志第 1 列是网关/容器 IP，`xff="-"` | 链路上没人写 `X-Forwarded-For`（裸端口映射、Podman slirp4netns） | 见 [访问日志里的客户端 IP](#访问日志里的客户端-ip) |
 
 #### 连不上公网时的两个 registry
 
