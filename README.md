@@ -110,6 +110,7 @@ docker logs dsh-web 2>&1 | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
 | `DSH_HOME` | `/dsh/home` | DSH 数据目录（profile、插件数据） |
 | `DSH_WEB_PORT` | `3080` | DSH Web UI 监听端口（改完要同步改 Nginx 配置） |
 | `DSH_HTTP_PORT` / `DSH_HTTPS_PORT` | `9080` / `9443` | **仅影响启动提示的显示**，真实端口以 `-p` 为准 |
+| `DSH_ENABLE_DATA_ANALYSIS` | 未设置 | 数据分析插件开关，`true` 则安装；不设置时以 `versions.yml` 的 `enabled` 为准（默认关） |
 | `DSH_READY_TIMEOUT` / `DSH_READY_HARD_TIMEOUT` / `DSH_DOWN_GRACE` | `120` / `0` / `90` | 就绪等待与故障容忍窗口，一般不用动 |
 
 完整清单见 [`profile.env`](profile.env)。
@@ -137,14 +138,49 @@ plugins:
 
 镜像内置三个插件：
 
-| 插件 | 作用 |
-|------|------|
-| `dsh-web-lan-access` | 局域网访问支持 |
-| `dsh-ctl` | 进程控制、界面里的计划内重启 |
-| `@chengxianglibra/dsh-data-analysis` | 数据分析（社区插件）：自然语言查指标、连数据源、出图表/报告，可导出 HTML |
+| 插件 | 作用 | 默认 |
+|------|------|------|
+| `dsh-web-lan-access` | 局域网访问支持 | 安装 |
+| `dsh-ctl` | 进程控制、界面里的计划内重启 | 安装 |
+| `@chengxianglibra/dsh-data-analysis` | 数据分析（社区插件）：自然语言查指标、连数据源、出图表/报告，可导出 HTML | **不安装** |
 
 > 插件是否装好，以 `dsh plugin list` 的实际结果为准（不是命令退出码），失败会自动重试 3 次。
 > 单个插件的安装日志在 `/dsh/log/plugins/<插件名>.log`。
+
+#### 插件开关 `enabled`
+
+每个插件都支持 `enabled` 字段，控制装不装。**不写即为启用**，所以老配置不用改：
+
+```yaml
+plugins:
+  - name: some-plugin
+    version: latest
+    profile: web
+    enabled: false        # false 则不安装；配置本身完整保留
+```
+
+`enabled: false` 时插件配置原样留在文件里，日志会明确提示「已跳过」，
+想启用改回 `true` 重启容器即可，不用重新补配置。
+
+**数据分析插件默认 `enabled: false`** —— 它依赖本地 Python 且要 pip 拉 `marivo`，
+体量大、首次装包慢。不需要自然语言分析 / 图表 / 看板时保持关闭，
+容器首次启动能快不少（实测约 25s vs 60s+）。
+
+需要时两种开法（优先级：环境变量 > `versions.yml`）：
+
+```bash
+# 方法一：不改配置，运行时开启
+docker run -d --name dsh-web \
+  -e DSH_ENABLE_DATA_ANALYSIS=true \
+  -p 9080:80 -p 9443:443 \
+  ghcr.io/higkoo/dsh:latest
+
+# 方法二：改 config/dsh/versions.yml 里该插件的 enabled 为 true，重启容器
+```
+
+> `DSH_ENABLE_DATA_ANALYSIS` 是数据分析插件专用的覆盖开关，
+> 环境变量优先于 `versions.yml`，且只影响这一个插件。
+> 关闭状态下启动日志会打印提示，不用担心「功能怎么没了」。
 
 ### 换 Python 安装方式（构建参数 `PYTHON_MODE`）
 
@@ -158,10 +194,15 @@ plugins:
 docker build --build-arg PYTHON_MODE=source -t dsh .
 ```
 
-> **为什么默认要装 Python**：DSH 本体不依赖 Python，但内置的数据分析插件强依赖它
-> （要 Python ≥ 3.10 且带 venv/ensurepip）。没有 Python 时插件会加载失败，
-> 进而拖垮整棵插件树、DSH 进程直接退出 —— 现象是「起不来、拿不到 token」。
+> **为什么默认要装 Python**：DSH 本体不依赖 Python，但数据分析插件强依赖它
+> （要 Python ≥ 3.10 且带 venv/ensurepip）。该插件**默认不安装**（见上节），
+> 但一旦你启用它，没有 Python 就会加载失败，进而拖垮整棵插件树、DSH 进程直接退出
+> —— 现象是「起不来、拿不到 token」。所以镜像默认仍把 Python 装上，
+> 保证「随时启用数据分析插件」这条路是通的。
 > 原理详见 [docs/DESIGN.md](docs/DESIGN.md#6-python-与内置插件的依赖关系)。
+
+> 若确定永远不用数据分析插件、又想把镜像压到最小，可用 `PYTHON_MODE=none` 构建，
+> 此时请保持 `versions.yml` 中该插件 `enabled: false`。
 
 ### 支持的平台
 
@@ -256,7 +297,7 @@ docker run -d --name dsh-web \
 | 标签 | 含义 | 场景 |
 |------|------|------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.4.3` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
+| `v0.4.4` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
 | `v0.4` | 次版本浮动，随补丁更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 |
 
@@ -339,8 +380,8 @@ bash test/test_versions_parser.sh    # versions.yml 解析器边界测试（CI �
 发布新版本：
 
 ```bash
-git tag -a v0.4.3 -m "v0.4.3: 变更说明"
-git push origin v0.4.3               # CI 自动 lint → 构建 → 推送镜像
+git tag -a v0.4.4 -m "v0.4.4: 变更说明"
+git push origin v0.4.4               # CI 自动 lint → 构建 → 推送镜像
 ```
 
 ## License

@@ -78,9 +78,9 @@ P1="$(sed -n '/^PLUGINS_START$/,/^PLUGINS_END$/p' /tmp/_c1 | sed '1d;$d')"
 assert_eq "dsh 版本剥离行内注释 => latest" "latest" "$V1"
 assert_eq "dsh url（注释掉的行）应为空" "" "$U1"
 assert_eq "插件行数应为 3" "3" "$(printf '%s' "$P1" | grep -c .)"
-assert_eq "插件1 完整字段" "dsh-web-lan-access|latest||web" "$(printf '%s\n' "$P1" | sed -n '1p')"
-assert_eq "插件2 完整字段" "dsh-ctl|latest||web" "$(printf '%s\n' "$P1" | sed -n '2p')"
-assert_eq "插件3 完整字段（scope 包名含 @ 与 /）" "@chengxianglibra/dsh-data-analysis|latest||web" "$(printf '%s\n' "$P1" | sed -n '3p')"
+assert_eq "插件1 完整字段" "dsh-web-lan-access|latest||web|" "$(printf '%s\n' "$P1" | sed -n '1p')"
+assert_eq "插件2 完整字段" "dsh-ctl|latest||web|" "$(printf '%s\n' "$P1" | sed -n '2p')"
+assert_eq "插件3 完整字段（scope 包名含 @ 与 /）" "@chengxianglibra/dsh-data-analysis|latest||web|false" "$(printf '%s\n' "$P1" | sed -n '3p')"
 echo
 
 # ---------- 用例2: 启用 URL 安装方式 ----------
@@ -94,7 +94,7 @@ plugins:
     profile: web'
 assert_eq "dsh version 保留引号内内容" "0.1.5-rc.1" "$(cat /tmp/_v)"
 assert_eq "dsh url 正确解析" "https://registry.npmjs.com/@deepseek-ai/dsh/-/dsh-0.1.5-rc.1.tgz" "$(cat /tmp/_u)"
-assert_eq "插件字段不受 dsh 段污染" "demo|latest||web" "$(cat /tmp/_p)"
+assert_eq "插件字段不受 dsh 段污染" "demo|latest||web|" "$(cat /tmp/_p)"
 echo
 
 # ---------- 用例3: 关键回归 —— 旧实现会把 url 串成 version ----------
@@ -107,7 +107,7 @@ plugins:
     profile: web'
 assert_eq "dsh version 应为空（旧实现在此会误取 2.3.4）" "" "$(cat /tmp/_v)"
 assert_eq "dsh url 正确" "https://example.com/dsh.tgz" "$(cat /tmp/_u)"
-assert_eq "插件 version 未被 dsh 段污染" "p1|2.3.4||web" "$(cat /tmp/_p)"
+assert_eq "插件 version 未被 dsh 段污染" "p1|2.3.4||web|" "$(cat /tmp/_p)"
 echo
 
 # ---------- 用例4: URL 中含 # （git 引用）----------
@@ -126,7 +126,7 @@ plugins:
   - name: 'quoted-plugin'
     profile: 'web'"
 assert_eq "单引号剥离" "0.2.0" "$(cat /tmp/_v)"
-assert_eq "插件名引号剥离" "quoted-plugin|||web" "$(cat /tmp/_p)"
+assert_eq "插件名引号剥离" "quoted-plugin|||web|" "$(cat /tmp/_p)"
 echo
 
 # ---------- 用例6: 多插件顺序与边界 ----------
@@ -146,10 +146,10 @@ plugins:
     version: 4.0.0'
 P6="$(cat /tmp/_p)"
 assert_eq "插件总数" "4" "$(printf '%s' "$P6" | grep -c .)"
-assert_eq "插件a" "a|1.0.0||web" "$(printf '%s\n' "$P6" | sed -n '1p')"
-assert_eq "插件b" "b||https://x/b.tgz|cli" "$(printf '%s\n' "$P6" | sed -n '2p')"
-assert_eq "插件c" "c|||web" "$(printf '%s\n' "$P6" | sed -n '3p')"
-assert_eq "插件d（末行无后续字段）" "d|4.0.0||" "$(printf '%s\n' "$P6" | sed -n '4p')"
+assert_eq "插件a" "a|1.0.0||web|" "$(printf '%s\n' "$P6" | sed -n '1p')"
+assert_eq "插件b" "b||https://x/b.tgz|cli|" "$(printf '%s\n' "$P6" | sed -n '2p')"
+assert_eq "插件c" "c|||web|" "$(printf '%s\n' "$P6" | sed -n '3p')"
+assert_eq "插件d（末行无后续字段）" "d|4.0.0|||" "$(printf '%s\n' "$P6" | sed -n '4p')"
 echo
 
 # ---------- 用例7: 注释与空行干扰 ----------
@@ -165,7 +165,7 @@ plugins:
     # version: 9.9.9   <- 被注释掉的版本
     profile: web'
 assert_eq "版本为 latest（未被注释干扰）" "latest" "$(cat /tmp/_v)"
-assert_eq "被注释的 version 不生效" "x|||web" "$(cat /tmp/_p)"
+assert_eq "被注释的 version 不生效" "x|||web|" "$(cat /tmp/_p)"
 echo
 
 # ---------- 用例8: 无 plugins 段 ----------
@@ -481,6 +481,185 @@ assert_eq "新建日志文件被检测到"  "CHANGED=yes" "$(printf '%s' "$NL_OU
 # 断言 4：清理干净
 assert_eq "全覆盖转发同样不留孤儿" "ORPHAN=0" "$(printf '%s' "$NL_OUT" | grep '^ORPHAN=' | head -1)"
 rm -rf "$NL_ROOT"
+
+# ---------- 用例16: enabled 字段解析 ----------
+echo
+echo "[用例16] enabled 字段解析（缺省即启用）"
+run_case "enabled 字段用例" 'dsh:
+  version: latest
+plugins:
+  - name: with-true
+    version: latest
+    enabled: true
+  - name: with-false
+    version: latest
+    enabled: false
+  - name: no-enabled
+    version: latest
+  - name: quoted-false
+    version: latest
+    enabled: "false"
+  - name: inline-comment
+    version: latest   # 保留注释
+    enabled: true     # 行内注释应被剥离
+'
+P16="$(cat /tmp/_p)"
+assert_eq "enabled 用例插件总数" "5" "$(printf '%s' "$P16" | grep -c .)"
+assert_eq "enabled: true 解析"        "with-true|latest|||true"        "$(printf '%s\n' "$P16" | sed -n '1p')"
+assert_eq "enabled: false 解析"       "with-false|latest|||false"      "$(printf '%s\n' "$P16" | sed -n '2p')"
+assert_eq "缺省 enabled 为空（视为启用）" "no-enabled|latest|||"        "$(printf '%s\n' "$P16" | sed -n '3p')"
+assert_eq "引号包裹的 false 剥离引号"  "quoted-false|latest|||false"    "$(printf '%s\n' "$P16" | sed -n '4p')"
+assert_eq "enabled 行内注释被剥离"     "inline-comment|latest|||true"   "$(printf '%s\n' "$P16" | sed -n '5p')"
+# 关键回归：version 行内注释不得把 enabled 吃掉
+assert_eq "version 行内注释仍正确剥离"  "latest" "$(printf '%s\n' "$P16" | sed -n '5p' | cut -d'|' -f2)"
+
+# ---------- 用例17: plugin_enabled 判定函数 ----------
+echo
+echo "[用例17] plugin_enabled 判定（大小写与别名 + 环境变量覆盖）"
+load_enabled_check() {
+    (
+        eval "$(sed -n '/^plugin_enabled()/,/^}/p' "$SCRIPT_DIR/install-dsh.sh")"
+        for v in "" "true" "True" "TRUE" "1" "yes" "YES" "on" "ON" "false" "False" "0" "no" "off" "garbage"; do
+            if plugin_enabled "some-plugin" "$v"; then r="on"; else r="off"; fi
+            # 空值用 <empty> 占位，避免行首丢失
+            printf '%s=%s\n' "${v:-<empty>}" "$r"
+        done
+    )
+}
+EN_OUT="$(load_enabled_check)"
+assert_eq "缺省空值 => 启用"      "on"  "$(printf '%s' "$EN_OUT" | grep '^<empty>=' | cut -d= -f2)"
+assert_eq "true => 启用"          "on"  "$(printf '%s' "$EN_OUT" | grep '^true=' | cut -d= -f2)"
+assert_eq "True（大小写不敏感）"   "on"  "$(printf '%s' "$EN_OUT" | grep '^True=' | cut -d= -f2)"
+assert_eq "TRUE（全大写）"        "on"  "$(printf '%s' "$EN_OUT" | grep '^TRUE=' | cut -d= -f2)"
+assert_eq "1 => 启用"             "on"  "$(printf '%s' "$EN_OUT" | grep '^1=' | cut -d= -f2)"
+assert_eq "yes => 启用"           "on"  "$(printf '%s' "$EN_OUT" | grep '^yes=' | cut -d= -f2)"
+assert_eq "on => 启用"            "on"  "$(printf '%s' "$EN_OUT" | grep '^on=' | cut -d= -f2)"
+assert_eq "false => 跳过"         "off" "$(printf '%s' "$EN_OUT" | grep '^false=' | cut -d= -f2)"
+assert_eq "False => 跳过"         "off" "$(printf '%s' "$EN_OUT" | grep '^False=' | cut -d= -f2)"
+assert_eq "0 => 跳过"             "off" "$(printf '%s' "$EN_OUT" | grep '^0=' | cut -d= -f2)"
+assert_eq "no => 跳过"            "off" "$(printf '%s' "$EN_OUT" | grep '^no=' | cut -d= -f2)"
+assert_eq "off => 跳过"           "off" "$(printf '%s' "$EN_OUT" | grep '^off=' | cut -d= -f2)"
+assert_eq "未知值 => 保守跳过"     "off" "$(printf '%s' "$EN_OUT" | grep '^garbage=' | cut -d= -f2)"
+
+# 环境变量覆盖：DSH_ENABLE_DATA_ANALYSIS 优先级最高
+DA="@chengxianglibra/dsh-data-analysis"
+env_check() {  # $1=环境变量值(可为空串表示不设)  $2=yml 里 enabled 值
+    (
+        eval "$(sed -n '/^plugin_enabled()/,/^}/p' "$SCRIPT_DIR/install-dsh.sh")"
+        if [ "$1" = "__UNSET__" ]; then unset DSH_ENABLE_DATA_ANALYSIS
+        else export DSH_ENABLE_DATA_ANALYSIS="$1"; fi
+        if plugin_enabled "$DA" "$2"; then echo on; else echo off; fi
+    )
+}
+assert_eq "未设环境变量 + yml false => 跳过"   "off" "$(env_check __UNSET__ false)"
+assert_eq "未设环境变量 + yml true  => 启用"   "on"  "$(env_check __UNSET__ true)"
+assert_eq "环境变量 true 覆盖 yml false => 启用" "on" "$(env_check true false)"
+assert_eq "环境变量 false 覆盖 yml true => 跳过" "off" "$(env_check false true)"
+assert_eq "环境变量空串不覆盖 yml true => 启用"  "on"  "$(env_check "" true)"
+# 环境变量只对指定插件生效，不得波及其他插件
+other_check() {
+    (
+        eval "$(sed -n '/^plugin_enabled()/,/^}/p' "$SCRIPT_DIR/install-dsh.sh")"
+        export DSH_ENABLE_DATA_ANALYSIS="true"
+        if plugin_enabled "some-other-plugin" "false"; then echo on; else echo off; fi
+    )
+}
+assert_eq "环境变量不影响其他插件（other=false 仍跳过）" "off" "$(other_check)"
+
+# ---------- 用例18: 真实仓库配置 —— 开关生效且配置保留 ----------
+echo
+echo "[用例18] 真实 versions.yml：data-analysis 关闭且配置完整"
+REAL_YML="$SCRIPT_DIR/../config/dsh/versions.yml"
+run_case "真实配置" "$(cat "$REAL_YML")"
+P18="$(cat /tmp/_p)"
+assert_eq "真实配置插件行数仍为 3（配置保留）" "3" "$(printf '%s' "$P18" | grep -c .)"
+assert_eq "核心插件1 默认启用"        "dsh-web-lan-access|latest||web|"            "$(printf '%s\n' "$P18" | sed -n '1p')"
+assert_eq "核心插件2 默认启用"        "dsh-ctl|latest||web|"                       "$(printf '%s\n' "$P18" | sed -n '2p')"
+assert_eq "data-analysis 已关闭但配置保留" "@chengxianglibra/dsh-data-analysis|latest||web|false" "$(printf '%s\n' "$P18" | sed -n '3p')"
+# 配置文件里必须仍能看到完整的 name / version / profile 三要素
+for k in "name: '@chengxianglibra/dsh-data-analysis'" "version: latest" "profile: web"; do
+    grep -qF "$k" "$REAL_YML" && GOT=yes || GOT=no
+    assert_eq "配置保留字段: $k" "yes" "$GOT"
+done
+
+# ---------- 用例19: 跨脚本的注册校验表达式必须逐字一致 ----------
+echo
+echo "[用例19] 跨脚本一致性（注册校验正则）"
+RE_INSTALL="$(grep -oE 'grep -qE "\([^"]+\)' "$SCRIPT_DIR/install-dsh.sh" | head -1)"
+RE_ENTRY="$(grep -oE 'grep -qE "\([^"]+\)' "$SCRIPT_DIR/entrypoint.sh" | head -1)"
+assert_eq "install-dsh.sh 与 entrypoint.sh 的注册正则逐字一致" "$RE_INSTALL" "$RE_ENTRY"
+[ -n "$RE_INSTALL" ] && assert_eq "正则确实被抽到（非空）" "yes" "yes" || assert_eq "正则确实被抽到（非空）" "yes" "no"
+
+# ---------- 用例20: entrypoint 的 plugin_enabled_in_versions ----------
+# 抽取 entrypoint.sh 里的该函数，指向临时 yml 文件求值。
+# 注意该函数读 ${DSH_ROOT}/config/dsh/versions.yml，需临时搭建目录树。
+echo
+echo "[用例20] entrypoint 单插件开关解析（与安装侧同源）"
+
+PROBE_ROOT="$(mktemp -d /tmp/root_XXXX)"
+mkdir -p "$PROBE_ROOT/config/dsh"
+write_yml() { printf '%s\n' "$1" > "$PROBE_ROOT/config/dsh/versions.yml"; }
+check_enabled() {  # $1=插件名  $2=yml内容
+    write_yml "$2"
+    (
+        DSH_ROOT="$PROBE_ROOT"
+        eval "$(sed -n '/^plugin_enabled_in_versions()/,/^}/p' "$SCRIPT_DIR/entrypoint.sh")"
+        plugin_enabled_in_versions "$1"
+    )
+}
+
+YML_MIX='dsh:
+  version: latest
+plugins:
+  - name: plugin-on
+    version: latest
+    enabled: true
+  - name: plugin-off
+    version: latest
+    enabled: false
+  - name: plugin-default
+    version: latest
+  - name: "@scope/plugin-off"
+    version: latest
+    enabled: "false"
+  - name: plugin-trailing
+    version: latest
+    enabled: true   # 行内注释
+
+after:
+  version: 9.9.9'
+
+assert_eq "enabled: true   => true"   "true"  "$(check_enabled plugin-on "$YML_MIX")"
+assert_eq "enabled: false  => false"  "false" "$(check_enabled plugin-off "$YML_MIX")"
+assert_eq "缺省 enabled    => true"   "true"  "$(check_enabled plugin-default "$YML_MIX")"
+assert_eq "带 scope 的包名 + 引号 false" "false" "$(check_enabled '@scope/plugin-off' "$YML_MIX")"
+assert_eq "enabled 行内注释被剥离"      "true"  "$(check_enabled plugin-trailing "$YML_MIX")"
+# 不存在的插件必须回退为 true（缺省即启用），避免误判导致插件被莫名跳过
+assert_eq "插件不存在     => true（回退）" "true" "$(check_enabled not-exist "$YML_MIX")"
+# 段外同名 key 不得串扰：after: 段之后的 enabled 不应被读到
+assert_eq "跨段不串扰（after 段后无 enabled）" "true" "$(check_enabled plugin-default "$YML_MIX")"
+
+# 关键回归：某插件的 enabled 不得泄漏给下一个未写 enabled 的插件
+YML_LEAK='plugins:
+  - name: first-off
+    version: latest
+    enabled: false
+  - name: second-default
+    version: latest
+  - name: third-off
+    version: latest
+    enabled: false'
+assert_eq "enabled 不向下泄漏（first）"  "false" "$(check_enabled first-off "$YML_LEAK")"
+assert_eq "enabled 不向下泄漏（second）" "true"  "$(check_enabled second-default "$YML_LEAK")"
+assert_eq "enabled 不向下泄漏（third）"  "false" "$(check_enabled third-off "$YML_LEAK")"
+
+# 真实仓库 yml：data-analysis 必须为 false，核心插件为 true
+REAL_RESULT="$(check_enabled '@chengxianglibra/dsh-data-analysis' "$(cat "$SCRIPT_DIR/../config/dsh/versions.yml")")"
+assert_eq "真实 yml：data-analysis => false" "false" "$REAL_RESULT"
+REAL_CORE="$(check_enabled 'dsh-ctl' "$(cat "$SCRIPT_DIR/../config/dsh/versions.yml")")"
+assert_eq "真实 yml：dsh-ctl => true（缺省）" "true" "$REAL_CORE"
+rm -rf "$PROBE_ROOT"
+
 echo
 echo "============================================"
 printf " 通过: \033[32m%d\033[0m   失败: \033[31m%d\033[0m\n" "$PASS" "$FAIL"

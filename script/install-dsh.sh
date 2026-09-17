@@ -51,10 +51,17 @@ extract_scalar() {
 # ------------------------------------------------------------
 # 解析版本配置文件，输出到全局变量：
 #   DSH_VERSION / DSH_URL  —— 仅取 dsh: 段内的字段
-#   PLUGINS                —— 每行 "name|version|url|profile"
+#   PLUGINS                —— 每行 "name|version|url|profile|enabled"
 #
 # 字段解析严格限定在所属缩进段内，避免 dsh 段与 plugins 段的
 # version:/url: 互相污染。解析器会自动剥离行尾注释。
+#
+# enabled 语义（缺省即启用，保证老配置无需改动）：
+#   不写 enabled        → true（启用）
+#   enabled: true       → 启用
+#   enabled: false      → 跳过安装，但配置区块完整保留
+# 本文件是纯 bash 正则解析，不经过 YAML 库，故 "false" 就是字符串，
+# 直接字符串比较即可（YAML 库会把 false 解析成布尔，注意区分）。
 # ------------------------------------------------------------
 parse_versions_file() {
     local file="$1"
@@ -64,11 +71,11 @@ parse_versions_file() {
     PLUGINS=""
 
     local section=""                                  # 当前顶层段：dsh / plugins / 其他
-    local cur_name="" cur_version="" cur_url="" cur_profile=""
+    local cur_name="" cur_version="" cur_url="" cur_profile="" cur_enabled=""
 
     flush_plugin() {
         if [ -n "$cur_name" ]; then
-            PLUGINS="${PLUGINS}${cur_name}|${cur_version}|${cur_url}|${cur_profile}"$'\n'
+            PLUGINS="${PLUGINS}${cur_name}|${cur_version}|${cur_url}|${cur_profile}|${cur_enabled}"$'\n'
         fi
     }
 
@@ -83,7 +90,7 @@ parse_versions_file() {
         if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*):[[:space:]]*$ ]]; then
             if [ "$section" = "plugins" ]; then
                 flush_plugin
-                cur_name=""; cur_version=""; cur_url=""; cur_profile=""
+                cur_name=""; cur_version=""; cur_url=""; cur_profile=""; cur_enabled=""
             fi
             section="${BASH_REMATCH[1]}"
             continue
@@ -104,13 +111,15 @@ parse_versions_file() {
             if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name:[[:space:]]*(.*)$ ]]; then
                 flush_plugin
                 cur_name="$(extract_scalar "${BASH_REMATCH[1]}")"
-                cur_version=""; cur_url=""; cur_profile=""
+                cur_version=""; cur_url=""; cur_profile=""; cur_enabled=""
             elif [[ "$line" =~ ^[[:space:]]+version:[[:space:]]*(.*)$ ]]; then
                 cur_version="$(extract_scalar "${BASH_REMATCH[1]}")"
             elif [[ "$line" =~ ^[[:space:]]+url:[[:space:]]*(.*)$ ]]; then
                 cur_url="$(extract_scalar "${BASH_REMATCH[1]}")"
             elif [[ "$line" =~ ^[[:space:]]+profile:[[:space:]]*(.*)$ ]]; then
                 cur_profile="$(extract_scalar "${BASH_REMATCH[1]}")"
+            elif [[ "$line" =~ ^[[:space:]]+enabled:[[:space:]]*(.*)$ ]]; then
+                cur_enabled="$(extract_scalar "${BASH_REMATCH[1]}")"
             fi
             continue
         fi
@@ -120,6 +129,37 @@ parse_versions_file() {
     if [ "$section" = "plugins" ]; then
         flush_plugin
     fi
+}
+
+# ------------------------------------------------------------
+# 判断插件是否启用（缺省即启用）
+#   ""      → 启用（老配置未写 enabled，语义保持不变）
+#   true/1/yes/on  → 启用
+#   其余（false/0/no/off/任意值）→ 跳过
+# 大小写不敏感。注意本脚本是纯 bash 字符串比较，不经 YAML 库。
+#
+# 环境变量覆盖（优先级最高，便于不改 yml 就启用）：
+#   DSH_ENABLE_DATA_ANALYSIS=true
+#   → 强制启用 @chengxianglibra/dsh-data-analysis（与 entrypoint 侧同名同义）
+# ------------------------------------------------------------
+plugin_enabled() {
+    local name="$1"
+    local v="${2:-}"
+
+    # 环境变量覆盖：目前仅数据分析插件有对应变量，需要时按同样模式扩展。
+    case "$name" in
+        "@chengxianglibra/dsh-data-analysis")
+            if [ -n "${DSH_ENABLE_DATA_ANALYSIS:-}" ]; then
+                v="$DSH_ENABLE_DATA_ANALYSIS"
+            fi
+            ;;
+    esac
+
+    v="$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')"
+    case "$v" in
+        ""|true|1|yes|on) return 0 ;;
+        *)                return 1 ;;
+    esac
 }
 
 # ------------------------------------------------------------
@@ -257,9 +297,13 @@ main() {
     echo "  插件列表:"
     if [ -n "$PLUGINS" ]; then
         # 用 herestring 而非管道，避免 while 体在子 shell 中执行
-        while IFS='|' read -r name version url profile || [ -n "$name" ]; do
+        while IFS='|' read -r name version url profile enabled || [ -n "$name" ]; do
             [ -n "$name" ] || continue
-            echo "    - $name (版本=${version:-latest}, 配置档=${profile:-web})"
+            if plugin_enabled "$name" "$enabled"; then
+                echo "    - $name (版本=${version:-latest}, 配置档=${profile:-web})"
+            else
+                echo "    - $name (版本=${version:-latest}, 配置档=${profile:-web}) [未启用]"
+            fi
         done <<< "$PLUGINS"
     else
         echo "    (无)"
@@ -275,16 +319,31 @@ main() {
         echo "============================================================"
 
         # herestring 循环：失败计数不会丢在子 shell 里
-        local failed=0
-        while IFS='|' read -r name version url profile || [ -n "$name" ]; do
-            if [ -n "$name" ]; then
-                install_plugin "$name" "$version" "$url" "$profile" || failed=$((failed+1))
+        local failed=0 skipped=0
+        while IFS='|' read -r name version url profile enabled || [ -n "$name" ]; do
+            [ -n "$name" ] || continue
+
+            # 未启用的插件：跳过安装，配置区块仍保留在 versions.yml 中，
+            # 改 enabled: true 并重启容器即可启用（重复执行是幂等的）。
+            if ! plugin_enabled "$name" "$enabled"; then
+                echo "------------------------------------------------------------"
+                echo "跳过插件: $name"
+                echo "  原因：versions.yml 中 enabled: ${enabled:-false}"
+                echo "  如需启用：把该插件的 enabled 改为 true，然后重启容器。"
+                echo "------------------------------------------------------------"
+                skipped=$((skipped+1))
+                continue
             fi
+
+            install_plugin "$name" "$version" "$url" "$profile" || failed=$((failed+1))
         done <<< "$PLUGINS"
 
         if [ "$failed" -gt 0 ]; then
             echo "错误：${failed} 个插件安装/注册失败"
             exit 1
+        fi
+        if [ "$skipped" -gt 0 ]; then
+            echo "提示：${skipped} 个插件因 enabled: false 未安装（配置已保留，可随时启用）"
         fi
     fi
 
