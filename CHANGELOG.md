@@ -5,6 +5,73 @@
 
 ---
 
+## [v0.4.4] — 2026-09-17 · 插件安装开关，数据分析插件默认不装
+
+### 背景
+
+数据分析插件 `@chengxianglibra/dsh-data-analysis` 依赖本地 Python 且要 pip 拉
+`marivo`，体量大、首次装包慢，而大多数部署并不需要自然语言分析 / 图表 / 看板。
+之前它是无条件安装的，没法关掉。
+
+### 改进
+
+- **新增通用 `enabled` 插件开关**：`config/dsh/versions.yml` 里每个插件都支持
+  `enabled: true/false`。**缺省即启用**，所以老配置无需改动。
+
+  ```yaml
+  plugins:
+    - name: '@chengxianglibra/dsh-data-analysis'
+      version: latest
+      profile: web
+      enabled: false        # 跳过安装，配置完整保留
+  ```
+
+- **数据分析插件默认关闭**：`enabled: false`，配置（name / version / url / profile）
+  原样保留。容器首次启动实测约 25s（此前 60s+）。
+
+- **跳过时给明确提示**，避免用户困惑「功能怎么没了」：
+
+  ```
+  跳过插件: @chengxianglibra/dsh-data-analysis
+    原因：versions.yml 中 enabled: false
+    如需启用：把该插件的 enabled 改为 true，然后重启容器。
+  ```
+
+- **环境变量覆盖**：`-e DSH_ENABLE_DATA_ANALYSIS=true` 可在不改配置的情况下
+  临时启用，优先级高于 `versions.yml`。
+
+- **首装与补装逻辑对齐**：`entrypoint.sh` 的补装兜底原本只认固定插件名单，
+  现在也读 `versions.yml` 并支持同样的环境变量覆盖，避免「首次装上了、
+  重启后又按跳过处理」这种不一致。
+
+### 开关语义
+
+| 写法 | 行为 |
+|------|------|
+| 不写 `enabled` | 启用（向后兼容） |
+| `enabled: true` | 启用；装失败则 `exit 1` |
+| `enabled: false` | 跳过安装，配置保留 |
+| `-e DSH_ENABLE_DATA_ANALYSIS=true` | 覆盖 `versions.yml`，强制启用该插件 |
+
+已实测三条路径行为一致：默认关闭 / 改 yml 为 true / 环境变量覆盖。
+另验证插件被手动删除后，重启容器补装逻辑只补核心插件、不误装被关闭的插件。
+
+### 改动文件
+
+```
+ CHANGELOG.md                  | 本节
+ README.md                     | 插件开关章节 + 环境变量表 + Python 说明
+ profile.env                   | 登记 DSH_ENABLE_DATA_ANALYSIS
+ config/dsh/versions.yml       | data-analysis 加 enabled: false
+ script/install-dsh.sh         | 解析 enabled + 跳过逻辑 + 环境变量覆盖
+ script/entrypoint.sh          | 补装兜底同源读 yml + 环境变量覆盖
+ test/test_versions_parser.sh  | 新增用例16–20（解析/判定/真实配置/一致性）
+```
+
+测试：`test_versions_parser.sh` 82 → 100 条断言，全绿；`shellcheck -S warning` 通过。
+
+---
+
 ## [v0.4.3] — 2026-09-17 · 访问日志显示来访者真实 IP
 
 真机反馈：Nginx 访问日志里客户端一栏显示的是 `10.0.2.100`（容器自身 IP），

@@ -373,6 +373,51 @@ ensure_plugin() {
     return 1
 }
 
+# ------------------------------------------------------------
+# 查询 versions.yml 中某插件的 enabled 值
+#   输出：true / false（缺省或解析不到一律 true，保持向后兼容）
+#
+# ⚠ 这里刻意**重新实现**了一份极简解析，而非 source install-dsh.sh：
+#   install-dsh.sh 末尾无条件执行 main，source 会连带跑一遍安装。
+#   与 install-dsh.sh 的 parse_versions_file 保持同样的语义：
+#   只在该插件自己的缩进段内找 enabled，缺省视为启用。
+# ------------------------------------------------------------
+plugin_enabled_in_versions() {
+    local target="$1"
+    local file="${DSH_ROOT}/config/dsh/versions.yml"
+
+    [ -f "$file" ] || { printf 'true'; return 0; }
+
+    awk -v target="$target" '
+        /^[[:space:]]*-[[:space:]]*name:[[:space:]]*/ {
+            line = $0
+            sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", line)
+            sub(/[[:space:]]*#.*$/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            gsub(/^["\x27]|["\x27]$/, "", line)
+            active = (line == target)
+            next
+        }
+        # 遇到下一个顶层段（无缩进的 key:）即结束 plugins 段
+        /^[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*$/ { active = 0; next }
+        active && /^[[:space:]]+enabled:[[:space:]]*/ {
+            v = $0
+            sub(/^[[:space:]]+enabled:[[:space:]]*/, "", v)
+            sub(/[[:space:]]*#.*$/, "", v)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            gsub(/^["\x27]|["\x27]$/, "", v)
+            print v
+            exit
+        }
+    ' "$file" | head -1 | tr '[:upper:]' '[:lower:]' | {
+        read -r v
+        case "${v:-}" in
+            ""|true|1|yes|on) printf 'true' ;;
+            *)                printf 'false' ;;
+        esac
+    }
+}
+
 # ============================================================
 # 0. 启动横幅
 # ============================================================
@@ -412,10 +457,31 @@ if ! command -v dsh &>/dev/null; then
 fi
 
 # 校验插件已注册（profiles/web 目录存在 ≠ 注册成功）
+#
+# ⚠ 这里与 install-dsh.sh 的插件列表**不是同一份来源** ——
+# entrypoint 只做「DSH 已装但插件缺失」的补装兜底，不跑完整安装流程。
+# 但「某个插件是否启用」必须与安装侧同源，否则用户在 versions.yml 里把
+# enabled 改成 true 后，首次安装装上了、重启时补装逻辑却依旧跳过它，
+# 造成行为不一致。故这里直接读 versions.yml，环境变量可强制覆盖。
 ensure_plugin "dsh-web-lan-access" "web" || true
 ensure_plugin "dsh-ctl" "web" || true
-# 数据分析插件是 npm scope 包名，必须写完整包名
-ensure_plugin "@chengxianglibra/dsh-data-analysis" "web" || true
+
+# 数据分析插件：默认关闭（versions.yml 中 enabled: false）。
+# 启用方式（二选一，优先级：环境变量 > versions.yml）：
+#   1. docker run -e DSH_ENABLE_DATA_ANALYSIS=true ...（本次生效）
+#   2. 把 versions.yml 里该插件的 enabled 改为 true（需重建镜像或挂载配置）
+DATA_ANALYSIS_PLUGIN="@chengxianglibra/dsh-data-analysis"
+if [ -n "${DSH_ENABLE_DATA_ANALYSIS:-}" ]; then
+    _data_analysis_on="$DSH_ENABLE_DATA_ANALYSIS"
+else
+    _data_analysis_on="$(plugin_enabled_in_versions "$DATA_ANALYSIS_PLUGIN")"
+fi
+if [ "$_data_analysis_on" = "true" ]; then
+    ensure_plugin "$DATA_ANALYSIS_PLUGIN" "web" || true
+else
+    echo "跳过插件 $DATA_ANALYSIS_PLUGIN（未启用；"
+    echo "  启用：-e DSH_ENABLE_DATA_ANALYSIS=true 或改 versions.yml 中该插件的 enabled）"
+fi
 
 # ============================================================
 # 2. 生成自签 SSL 证书（仅在证书不存在时生成）

@@ -29,7 +29,14 @@ plugins:
 
   # 数据分析插件（Marivo 语义分析：自然语言分析、图表/报告/看板）
   # 注意：包名带 npm scope，不能省略 @chengxianglibra/ 前缀
+  #
+  # enabled: 插件安装开关，缺省为 true（不写即启用）。
+  #   true  → 安装该插件
+  #   false → 跳过安装，配置完整保留，改回 true 并重启容器即可启用
+  # 该插件依赖本地 Python（>=3.10）与 pip 拉取 marivo，体量较大且
+  # 首次装包耗时明显；不需要数据分析功能时保持 false 可显著加快启动。
   - name: '@chengxianglibra/dsh-data-analysis'
     version: latest
     # url: https://registry.npmjs.com/@chengxianglibra/dsh-data-analysis/-/dsh-data-analysis-0.2.1.tgz
     profile: web
+    enabled: false
