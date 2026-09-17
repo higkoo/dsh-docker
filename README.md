@@ -186,8 +186,17 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 
 ```
 [18:12:17] ==> /dsh/log/nginx/access.log <==
-[18:12:17] 127.0.0.1 - - [16/Sep/2026:18:12:17 +0800] "GET / HTTP/1.1" 401 79
+[18:12:17] 10.88.7.123 - - [16/Sep/2026:18:12:17 +0800] "GET / HTTP/1.1" 401 79 "-" "Mozilla/5.0 ..." hop=172.17.0.1 xff="10.88.7.123, 10.0.2.100"
 ```
+
+访问日志**第 1 列就是来访者的真实 IP** —— 即使 DSH 跑在网关 / LB / 端口映射
+后面（由 Nginx 的 `realip` 模块从 `X-Forwarded-For` 解析），定位问题不用再猜：
+
+| 字段 | 含义 |
+|------|------|
+| 第 1 列 | **真实客户端 IP** |
+| `hop=` | 直连 Nginx 的那一跳（Docker 网关 / 容器自身 / 某台代理） |
+| `xff=` | 完整 XFF 链，多层代理时能看出请求经过哪些跳 |
 
 日志按来源分目录存放，找问题直接去对应目录：
 
@@ -203,11 +212,32 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 |------|-----------|--------|
 | 一直「DSH 启动中...」 | 数据分析插件在建 venv、装依赖，正常 | 等 5~10 分钟，心跳还在就别动它 |
 | 日志停在「dsh web 启动 #1」不动 | DSH 正在装插件的重依赖，中间不写日志属正常 | 看 `[18:12:17] ==> install.log <==` 段是否在刷 |
-| 容器 `exit 1` 退出 | 就绪超时，通常是**容器连不上 npm registry** | 检查网络/代理；日志末尾会打印原因 |
+| 容器 `exit 1`，日志提到 **pnpm failed / `registry.npmjs.org`** | pnpm 自举下二进制时**不读 npmrc**，硬走 `registry.npmjs.org` | 加 `-e COREPACK_NPM_REGISTRY=https://registry.npmmirror.com/`（见下） |
+| 容器 `exit 1`，日志提到 **`pypi.org` / marivo 装不上** | 数据分析插件用 pip 装 Python 包，直连 PyPI | 加 `-e PIP_INDEX_URL=...`（见下） |
 | 日志里一堆 Node 崩溃栈，提到 `plugin tree failed to load` | 某个插件加载失败（如 `none` 模式下缺 Python） | 用默认 `apt` 模式重构建 |
 | 访问 401 / 页面空白 | token 不对或没带 | 用 `tail -1` 重新取；`dshctl` 重启后 token 会变 |
 | `less` 看中文日志显示 `<E5><8A><A0>` | 是旧镜像（≤ v0.3.7）缺 locale，不是文件坏了 | 升级到 v0.4.0+；临时 `export LC_ALL=C.UTF-8` |
 | 服务起来了但界面打不开 | 端口没映射对 | 确认 `docker run -p` 与 `config/nginx/conf.d/dsh-proxy.conf` |
+
+#### 连不上公网时的两个 registry
+
+镜像里已把 **npm** 指向 `registry.npmmirror.com`，但有两处**不吃这个配置**，
+在无法直连公网的机器上会导致容器 `exit 1`：
+
+```bash
+docker run -d --name dsh-web \
+  -e COREPACK_NPM_REGISTRY=https://registry.npmmirror.com/ \
+  -e PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+  -e PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+  -p 9080:80 -p 9443:443 \
+  ghcr.io/higkoo/dsh:latest
+```
+
+- `COREPACK_NPM_REGISTRY` —— pnpm 是 Corepack 包装器，自举下载自身二进制时
+  **只认这个变量**，`npmrc` / `npm_config_registry` 都不起作用；
+- `PIP_INDEX_URL` —— 数据分析插件用 pip 装 `marivo`，容器内没有 pip 配置。
+
+> 能直连公网的话不需要加，原样跑即可。
 
 ### 容器会自动重启吗
 
@@ -226,7 +256,7 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 | 标签 | 含义 | 场景 |
 |------|------|------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.4.2` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
+| `v0.4.3` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
 | `v0.4` | 次版本浮动，随补丁更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 |
 
@@ -309,8 +339,8 @@ bash test/test_versions_parser.sh    # versions.yml 解析器边界测试（CI �
 发布新版本：
 
 ```bash
-git tag -a v0.4.2 -m "v0.4.2: 变更说明"
-git push origin v0.4.2               # CI 自动 lint → 构建 → 推送镜像
+git tag -a v0.4.3 -m "v0.4.3: 变更说明"
+git push origin v0.4.3               # CI 自动 lint → 构建 → 推送镜像
 ```
 
 ## License
