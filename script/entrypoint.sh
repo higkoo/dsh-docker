@@ -4,16 +4,17 @@ set -e
 # ============================================================
 # DSH Docker 容器启动脚本
 #
-# 六个阶段：
-#   [1/6] 安装 DSH 及插件（读 versions.yml），校验插件注册
-#   [2/6] 生成自签 SSL 证书
-#   [3/6] 启动 Nginx 反向代理（80 / 443）
-#   [4/6] 启动 DSH Web UI，等待就绪并解析访问 token
-#   [5/6] 输出访问地址
-#   [6/6] 前台看护（服务级健康检查，容忍 dsh-ctl 计划内重启）
+# 七个阶段：
+#   [1/7] 安装 DSH 及插件（读 versions.yml），校验插件注册
+#   [2/7] 渲染 Nginx 配置（注入 trusted-host 白名单与 DSH 上游地址）
+#   [3/7] 生成自签 SSL 证书
+#   [4/7] 启动 Nginx 反向代理（80 / 443）
+#   [5/7] 启动 DSH Web UI，等待就绪并解析访问 token
+#   [6/7] 输出访问地址
+#   [7/7] 前台看护（服务级健康检查，容忍 dsh-ctl 计划内重启）
 #
 # 任何一步不成立就立即退出，让 --restart / 编排系统感知失败。
-# 就绪判据、看护策略等设计原理见 docs/DESIGN.md。
+# 就绪判据、看护策略、trusted-host 的设计原理见 docs/DESIGN.md。
 # ============================================================
 
 # 加载用户环境变量（/dsh/profile.env，改完重启容器生效）
@@ -59,6 +60,16 @@ SSL_DIR="${DSH_ROOT}/config/nginx/ssl"
 DSH_LOG="${DSH_LOG_DIR}/dsh-web.log"
 NGINX_PID_FILE="${RUN_DIR}/nginx.pid"
 DSH_HEALTH_URL="http://${DSH_WEB_HOST}:${DSH_WEB_PORT}"
+
+# Nginx 配置渲染相关路径
+#   NGINX_SRC_DIR  源模板目录（/dsh/config/nginx，含 __XXX__ 占位符）
+#   NGINX_RUN_DIR  渲染产物目录（nginx.conf 从这里 include conf.d/*.conf）
+# 「模板」与「运行时产物」分开，好处是容器重启即重新渲染，
+# 用户改环境变量就能生效，不必直接编辑 /dsh/config 下的模板。
+NGINX_SRC_DIR="${DSH_ROOT}/config/nginx"
+NGINX_RUN_DIR="${RUN_DIR}/nginx"
+NGINX_RUN_CONF="${NGINX_RUN_DIR}/nginx.conf"
+NGINX_RUN_CONFD="${NGINX_RUN_DIR}/conf.d"
 
 mkdir -p "$DSH_LOG_DIR" "$NGINX_LOG_DIR" "$RUN_DIR" "$SSL_DIR" "$DSH_HOME"
 
@@ -419,6 +430,258 @@ plugin_enabled_in_versions() {
 }
 
 # ============================================================
+# trusted-host 白名单：解析 + 生成 nginx map 条目
+#
+# 背景：为了让插件跳第三方认证时能正确拼出回调地址，Nginx 不再改写
+# Host / Origin，改为原样透传。于是需要一份「合法来访域名」名单，
+# 由 entrypoint 渲染进 nginx 的 map 里做访问闸门。
+#
+# 名单来源（优先级从高到低）：
+#   1. 环境变量 DSH_TRUSTED_HOSTS（docker run -e 注入，便于编排）
+#   2. 配置文件 config/dsh/trusted-hosts.txt（便于人工维护）
+#   3. 都没有 → 空名单，**只放行回环地址**（fail-closed）
+#
+# 支持逗号 / 分号 / 空白混合分隔，条目可带端口。
+# ============================================================
+
+TRUSTED_HOSTS_FILE="${DSH_ROOT}/config/dsh/trusted-hosts.txt"
+TRUSTED_HOSTS_LIST=""
+TRUSTED_HOSTS_RAW_COUNT=0
+
+# 规范化单个条目：去空白/引号、去协议前缀、去路径、去结尾点、转小写。
+# 这样 `https://DSH.Corp.COM/path` 与 `dsh.corp.com.` 都能归一到同一形态，
+# 避免「用户写的和浏览器发的对不上」而莫名 403。
+normalize_trusted_host() {
+    local h="$1"
+    h="${h#"${h%%[![:space:]]*}"}"                     # 去前导空白
+    h="${h%"${h##*[![:space:]]}"}"                     # 去尾随空白
+    h="${h%\"}"; h="${h#\"}"                           # 去双引号
+    h="${h%\'}"; h="${h#\'}"                           # 去单引号
+    h="${h#http://}"; h="${h#https://}"                # 去协议前缀
+    h="${h%%/*}"                                       # 去路径
+    while [ "${h%%.}" != "$h" ]; do h="${h%.}"; done   # 去结尾的点（FQDN 写法）
+    printf '%s' "$h" | tr '[:upper:]' '[:lower:]'      # 统一小写（Host 头大小写不敏感）
+}
+
+# 合法性校验：只允许域名/IP 里可能出现的字符。
+# 目的是拦住明显写错的条目（含空格、中文、通配符等），
+# 而不是做严格的 DNS 校验 —— 过严会把合法用例挡在外面。
+is_valid_trusted_host() {
+    case "$1" in
+        "") return 1 ;;
+        *[!A-Za-z0-9._:\[\]-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# 判断条目是否显式带了端口（决定生成哪种 nginx 规则）。
+# 形如：dsh.corp.com:9080 → 有端口；dsh.corp.com → 无；[::1]:80 → 有。
+# 注意 `a:b:c`、`host:`（空端口）都算「没有合法端口」。
+has_explicit_port() {
+    local host="$1" rest port
+    case "$host" in
+        \[*\]*)  rest="${host#*\]}" ;;     # 带方括号的 IPv6：方括号之后才是端口部分
+        *)       rest="$host" ;;
+    esac
+    case "$rest" in
+        :*) ;;                             # 形如 `[::1]:9080`
+        *:*) rest="${rest##*:}" ;;         # 形如 `dsh.corp.com:9080`，取最后一段
+        *)  return 1 ;;                    # 压根没有冒号 → 无端口
+    esac
+    # rest 现在是「冒号之后」的那一段，必须非空且全为数字
+    port="${rest#:}"
+    case "$port" in
+        "") return 1 ;;
+        *[!0-9]*) return 1 ;;
+    esac
+    # 端口之前必须还有内容 —— 光杆 `:9080` 不是合法主机
+    [ "$port" != "$host" ] || return 1
+    return 0
+}
+
+# 输出「原始未清洗」的条目流，一行一个。
+collect_trusted_host_raw() {
+    if [ -n "${DSH_TRUSTED_HOSTS:-}" ]; then
+        # 环境变量支持逗号 / 分号 / 空白混合分隔：
+        #   先把分隔符统一成换行，再逐行清洗，避免用户纠结该用哪种。
+        printf '%s' "$DSH_TRUSTED_HOSTS" | tr ',;' '\n'
+        printf '\n'   # 见下方「尾随换行」说明
+        return 0
+    fi
+    if [ -f "$TRUSTED_HOSTS_FILE" ]; then
+        # 去掉行尾注释后输出（注释符 '#' 之后一律忽略）
+        sed -e 's/#.*$//' "$TRUSTED_HOSTS_FILE"
+        printf '\n'   # 见下方「尾随换行」说明
+        return 0
+    fi
+    return 0
+}
+
+# ⚠ 上面两个分支末尾都必须补一个换行 —— 这是踩过的坑：
+#
+#   `while IFS= read -r line; do ...; done < <(producer)`
+#   在 producer 输出**不以换行结尾**时，会静默丢弃最后一行。
+#   （bash 的 read 在 EOF 处遇到不完整行返回非 0，循环体不执行。）
+#
+#   这正好击中两种最常见的用户写法：
+#     - `-e DSH_TRUSTED_HOSTS="a.com,b.com"`  → tr 之后末行无换行 → b.com 被丢
+#     - 白名单文件用 `printf ... > file` 写出、没有行尾换行
+#   → 表现为「白名单里明明写了这个域名，却一直 403」，极难排查。
+#
+#   补一个空行是最稳的做法：空行在 load_trusted_hosts 里会被跳过。
+
+# 把一行按逗号 / 分号 / 空白切成多个条目。
+# ⚠ 必须显式设置 IFS：默认 IFS 含**冒号**，会把 `dsh.corp.com:9443`
+#   切成 `dsh.corp.com` 与 `9443` 两段 —— 端口静默丢失，
+#   还多出一个纯数字垃圾条目。
+split_trusted_host_line() {
+    local line="$1" host
+    local IFS=$' \t,;'
+    # shellcheck disable=SC2086  # 这里就是要按 IFS 分词，加引号反而失去作用
+    for host in $line; do
+        [ -n "$host" ] && printf '%s\n' "$host"
+    done
+}
+
+# 解析白名单，结果写入全局 TRUSTED_HOSTS_LIST（每行一个）与计数。
+load_trusted_hosts() {
+    TRUSTED_HOSTS_LIST=""
+    TRUSTED_HOSTS_RAW_COUNT=0
+
+    # seen 以换行开头：保证第一条域名在 seen 里也带前边界，
+    # 否则查重模式 $'\n'"a.com"$'\n' 匹配不上（缺前边界），
+    # 导致 `a.com,A.COM,a.com` 重复生成规则。
+    local line host candidate seen=$'\n'
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # 一行可能有多个条目（配置文件里一行写了多个），逐个取
+        while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            host="$(normalize_trusted_host "$candidate")"
+            [ -n "$host" ] || continue
+            if ! is_valid_trusted_host "$host"; then
+                echo "  警告：忽略非法 trusted-host 写法：[$candidate]"
+                continue
+            fi
+            # 去重：同一个域名只生成一次规则。
+            # 必须用「前后各一个换行做边界」的整体子串匹配 ——
+            # 若只匹配 `${host}` + 换行，`a.com` 会误伤 `x.a.com`
+            #（两者都含 "a.com\n"）。
+            case "${seen}" in
+                *$'\n'"${host}"$'\n'*) continue ;;
+            esac
+            seen="${seen}${host}"$'\n'
+            TRUSTED_HOSTS_LIST="${TRUSTED_HOSTS_LIST}${host}"$'\n'
+            TRUSTED_HOSTS_RAW_COUNT=$((TRUSTED_HOSTS_RAW_COUNT + 1))
+        done < <(split_trusted_host_line "$line")
+    done < <(collect_trusted_host_raw)
+}
+
+# 生成 nginx map 的条目文本。两种形态：
+#   纯域名（dsh.corp.com）→ 精确规则 + 带端口正则，两种 Host 形态都放行
+#   域名+端口（x.com:9443）→ 仅精确匹配该 Host 字面量
+#
+# ⚠ 带端口那条**必须用正则** `~^dsh\.corp\.com:`，不能写成 `"host:*"`：
+#   nginx map 的通配只支持「前缀 *」「后缀 *」「*.中间.*」三种，
+#   而 `*` 与 `:` 之间没有点分隔，`dsh.corp.com:*` 会被当成**字面量**，
+#   永远匹配不上 → 所有带端口的访问（也就是绝大多数）全被判成 403。
+build_trusted_host_map() {
+    local host escaped
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        if has_explicit_port "$host"; then
+            # 用户显式写了端口：按**精确 Host 字面量**匹配，不做正则转义 ——
+            # 精确规则里的 `\.` 不生效，会把反斜杠也当成 Host 的一部分。
+            printf '    "%s" 0;\n' "$host"
+        else
+            # 只有域名：无端口（80/443）与任意端口都放行。
+            # 正则中 `.` 必须转义，否则 `a.com` 会顺带匹配 `axcom`。
+            escaped="$(printf '%s' "$host" | sed -e 's/\./\\./g')"
+            printf '    "%s" 0;\n    "~^%s:" 0;\n' "$host" "$escaped"
+        fi
+    done <<< "$TRUSTED_HOSTS_LIST"
+}
+
+# 渲染 Nginx 配置：把模板里的占位符替换成实际值。
+#
+#   __TRUSTED_HOST_MAP__ → 白名单 map 条目
+#   __DSH_WEB_HOST__     → DSH 监听地址
+#   __DSH_WEB_PORT__     → DSH 监听端口
+#   __DSH_DENY_LOG__     → 被拒请求是否留痕（"1" 记录 / "0" 不记）
+#
+# 渲染产物写到 NGINX_RUN_DIR（默认 /dsh/run/nginx），nginx.conf 从这里加载。
+# 之所以不直接改 /dsh/config 下的模板，是为了让「用户可编辑的源文件」
+# 与「运行时产物」分开 —— 容器重启即重新渲染，模板保持干净。
+render_nginx_conf() {
+    # 被拒请求的留痕开关：off（大小写不敏感）→ "0" 不记；其余 → "1" 记录。
+    # ⚠ 只接受 1/0 这种「非空即真」的取值，因为 nginx 的 `access_log ... if=`
+    #   仅把 `0` 与空串视为假。不要把 nginx 的日志级别名（debug/warn…）传进来，
+    #   它会被当成非零值 → 恒记录，看起来像开关失效。
+    local deny_log="1"
+    case "$(printf '%s' "${DSH_TRUSTED_HOST_DENY_LOG:-debug}" | tr '[:upper:]' '[:lower:]')" in
+        off|no|0|false) deny_log="0" ;;
+    esac
+    local host_map
+
+    load_trusted_hosts
+    host_map="$(build_trusted_host_map)"
+
+    mkdir -p "$NGINX_RUN_CONFD"
+    # 反向代理模板里引用 /dsh/log/nginx/denied.log —— 目录必须先存在，
+    # 否则 nginx -t 就会因 open() 失败而拒绝启动（不是运行时才报错）。
+    mkdir -p "$NGINX_LOG_DIR"
+
+    # 主配置：整体原样复制（模板里没有需要替换的占位符）
+    cp "${NGINX_SRC_DIR}/nginx.conf" "$NGINX_RUN_CONF"
+
+    # 反代配置：替换上游地址、留痕开关与白名单 map。
+    # 用 | 作分隔符，避免域名里的 / 冲突；$ 不是分隔符，无需转义 $http_host 之类。
+    # 多行替换用 sed 的 `r` 读文件更稳（避免把整段 map 挤进替换串）：
+    #   先把占位符单独替换成一个哨兵行，再用 `r` 把 map 内容读进来。
+    sed -e "s|__DSH_WEB_HOST__|${DSH_WEB_HOST}|g" \
+        -e "s|__DSH_WEB_PORT__|${DSH_WEB_PORT}|g" \
+        -e "s|__DSH_DENY_LOG__|${deny_log}|g" \
+        -e "s|^[[:space:]]*__TRUSTED_HOST_MAP__[[:space:]]*$|__TRUSTED_HOST_MAP_PLACEHOLDER__|" \
+        "${NGINX_SRC_DIR}/conf.d/dsh-proxy.conf" > "${NGINX_RUN_CONFD}/dsh-proxy.conf"
+
+    if [ -n "$host_map" ]; then
+        local map_tmp="${NGINX_RUN_CONFD}/.trusted-host-map.tmp"
+        printf '%s\n' "$host_map" > "$map_tmp"
+        sed -i -e "/^__TRUSTED_HOST_MAP_PLACEHOLDER__$/r ${map_tmp}" \
+               -e "/^__TRUSTED_HOST_MAP_PLACEHOLDER__$/d" "${NGINX_RUN_CONFD}/dsh-proxy.conf"
+        rm -f "$map_tmp"
+    else
+        sed -i -e "/^__TRUSTED_HOST_MAP_PLACEHOLDER__$/d" "${NGINX_RUN_CONFD}/dsh-proxy.conf"
+    fi
+
+    # 渲染残留检查：任何一个 __XXX__ 没换干净都说明模板与脚本不同步，
+    # 此时 nginx 会以「unknown directive」之类的方式报错，不如在这里直接失败。
+    # ⚠ 必须排除注释行：模板的说明性注释里**故意**写了占位符的名字
+    #   （例如「由 entrypoint.sh 注入 __TRUSTED_HOST_MAP__」），
+    #   一并检查会把正常渲染判成失败。
+    if grep -nE '__[A-Z_]+__' "$NGINX_RUN_CONF" "${NGINX_RUN_CONFD}/dsh-proxy.conf" \
+        | grep -vE ':[[:space:]]*#'; then
+        echo "  错误：Nginx 配置渲染后仍残留占位符（模板与 entrypoint.sh 不同步）" >&2
+        exit 1
+    fi
+
+    # 报告渲染结果，让「为什么被拒」在启动阶段就可回答
+    local n="${TRUSTED_HOSTS_RAW_COUNT}"
+    if [ "$n" -eq 0 ]; then
+        echo "  警告：未配置 trusted-host 白名单，当前**只允许**回环地址访问"
+        echo "        配置方式：编辑 ${TRUSTED_HOSTS_FILE}，或加环境变量"
+        echo "                  -e DSH_TRUSTED_HOSTS=\"你的域名或IP\""
+    else
+        echo "  trusted-host 白名单（${n} 条，仅这些域名可访问）："
+        while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            echo "    - ${t}"
+        done <<< "$TRUSTED_HOSTS_LIST"
+    fi
+    echo "  被拒的访问会记入 ${NGINX_LOG_DIR}/denied.log（首列即 Host）；"
+    echo "  不想留痕：-e DSH_TRUSTED_HOST_DENY_LOG=off"
+}
+
 # 0. 启动横幅
 # ============================================================
 echo "============================================================"
@@ -434,7 +697,7 @@ echo "============================================================"
 # 1. 安装 DSH 及插件（如果尚未安装）
 # ============================================================
 if ! command -v dsh &>/dev/null; then
-    echo "[1/6] DSH 尚未安装，执行安装脚本..."
+    echo "[1/7] DSH 尚未安装，执行安装脚本..."
     if ! bash "${DSH_ROOT}/script/install-dsh.sh"; then
         echo "============================================================"
         echo "  错误：DSH 安装脚本执行失败"
@@ -447,7 +710,7 @@ if ! command -v dsh &>/dev/null; then
         exit 1
     fi
 else
-    echo "[1/6] DSH 已安装: $(dsh --version 2>&1)"
+    echo "[1/7] DSH 已安装: $(dsh --version 2>&1)"
 fi
 
 # 安装后再确认一次，避免 install-dsh.sh 静默失败导致后面 command not found
@@ -484,10 +747,18 @@ else
 fi
 
 # ============================================================
-# 2. 生成自签 SSL 证书（仅在证书不存在时生成）
+# 2. 渲染 Nginx 配置（注入 trusted-host 白名单与 DSH 上游地址）
+# ============================================================
+#    必须在启动 Nginx **之前**做：nginx 加载的是渲染产物，
+#    模板里的占位符残留会让它直接启动失败。
+echo "[2/7] 渲染 Nginx 配置（trusted-host 白名单）..."
+render_nginx_conf
+
+# ============================================================
+# 3. 生成自签 SSL 证书（仅在证书不存在时生成）
 # ============================================================
 if [ ! -f "${SSL_DIR}/dsh.crt" ]; then
-    echo "[2/6] 生成自签证书..."
+    echo "[3/7] 生成自签证书..."
     openssl req -x509 -newkey rsa:2048 -nodes \
         -keyout "${SSL_DIR}/dsh.key" \
         -out "${SSL_DIR}/dsh.crt" \
@@ -498,13 +769,15 @@ if [ ! -f "${SSL_DIR}/dsh.crt" ]; then
 fi
 
 # ============================================================
-# 3. 启动 Nginx 反向代理（80 / 443）
+# 4. 启动 Nginx 反向代理（80 / 443）
 #    nginx 默认 daemon 模式：master fork 后父进程即退出，
 #    故不能靠 `&` + $! 取 PID，改用 nginx 自己写的 pid 文件。
 # ============================================================
-echo "[3/6] 启动 Nginx 反向代理 (port 80/443)..."
+echo "[4/7] 启动 Nginx 反向代理 (port 80/443)..."
 cleanup_stale_pid
 
+# nginx.conf 已被软链到 /etc/nginx/nginx.conf（见 Dockerfile），
+# 但这里仍显式指定，避免软链缺失时跑偏。
 if ! nginx -c "${DSH_ROOT}/config/nginx/nginx.conf" 2>&1; then
     echo "  错误：Nginx 启动失败，配置检查输出如下："
     nginx -t -c "${DSH_ROOT}/config/nginx/nginx.conf" 2>&1 || true
@@ -573,7 +846,7 @@ parse_dsh_access() {
 #   避免在「只是 token 变了」的场合又说一次「已就绪」。
 # ------------------------------------------------------------
 print_access_info() {
-    local tag="${1:-[5/6]}"
+    local tag="${1:-[6/7]}"
     local title="${2:-DSH 已就绪，请访问}"
     echo "============================================================"
     echo "  $tag $title:"
@@ -590,12 +863,12 @@ print_access_info() {
 }
 
 # ============================================================
-# 4. 启动 DSH 并抓取访问 token
+# 5. 启动 DSH 并抓取访问 token
 #    就绪行本身即「插件树全部加载成功」，token 必在同一行，
 #    不存在「就绪了却没 token」的中间态，故无需另起一轮抓取。
 #    回到这里只有两种可能：已就绪，或进程已死（→ 重试）。
 # ============================================================
-echo "[4/6] 启动 DSH Web UI（首次启动需初始化插件，请耐心等待）..."
+echo "[5/7] 启动 DSH Web UI（首次启动需初始化插件，请耐心等待）..."
 TOKEN=""
 WEB_URL=""
 LAN_URL=""
@@ -639,10 +912,10 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
 done
 
 # ============================================================
-# 5. 输出访问地址
+# 6. 输出访问地址
 # ============================================================
 if [ -n "$TOKEN" ]; then
-    print_access_info "[5/6]"
+    print_access_info "[6/7]"
 else
     echo "============================================================"
     echo "  错误：DSH 启动失败，未能获得访问 token"
@@ -655,12 +928,12 @@ else
 fi
 
 # ============================================================
-# 6. 日志跟踪（后台）+ 进程看护（前台，必须是 PID 1 的主流程）
+# 7. 日志跟踪（后台）+ 进程看护（前台，必须是 PID 1 的主流程）
 #    子 shell 里的 exit 只结束子 shell，不会让容器退出。
 #    日志跟踪覆盖 /dsh/log/*/*.log 全部日志：有新日志文件出现
 #    无需改脚本即可被看到。
 # ============================================================
-echo "[6/6] 开始跟踪日志 ($DSH_ROOT/log/*/*.log)..."
+echo "[7/7] 开始跟踪日志 ($DSH_ROOT/log/*/*.log)..."
 # 交棒给统一的转发器：覆盖全部日志文件 + 时间戳 + 自动纳入新建文件。
 start_log_follow
 

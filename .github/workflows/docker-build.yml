@@ -41,7 +41,7 @@ env:
   PYTHON_MODE: ${{ inputs.python_mode || 'apt' }}
   # OCI 描述文案：Dockerfile 的 LABEL 与 CI 的 index 注解共用同一来源，
   # 避免两处各写一份导致不一致
-  IMAGE_DESCRIPTION: "DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"
+  IMAGE_DESCRIPTION: "DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理（trusted-host 域名白名单、Host/Origin 原样透传）、自签 HTTPS、进程看护与健康检查。"
 
 jobs:
   # ============================================================
@@ -57,15 +57,29 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           scandir: ./script
-          additional_files: ./test/test_versions_parser.sh
+          additional_files: ./test/test_versions_parser.sh ./test/test_trusted_host.sh
 
       - name: Bash syntax check
         run: |
           bash -n script/entrypoint.sh
           bash -n script/install-dsh.sh
+          bash -n test/test_trusted_host.sh
+          bash -n profile.env
 
       - name: Run versions.yml parser tests
         run: bash test/test_versions_parser.sh
+
+      # trusted-host 白名单回归测试。
+      #
+      # ubuntu-latest 自带 nginx，因此用例 11 的「真实语义验证」
+      # （渲染后的配置跑 nginx -t + 白名单放行/拒绝 / Host、Origin 透传）
+      # 会真正执行，而不是被跳过。
+      - name: Run trusted-host tests
+        run: |
+          # 用例 11 需要在非特权端口上起 nginx，先确保端口空闲
+          sudo systemctl stop nginx 2>/dev/null || true
+          sudo pkill -f 'nginx' 2>/dev/null || true
+          bash test/test_trusted_host.sh
 
       - name: Validate YAML files
         run: |

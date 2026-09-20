@@ -26,21 +26,28 @@
    - [9.1 访问日志里的真实客户端 IP](#91-访问日志里的真实客户端-ip)
 10. [插件注册校验：为什么必须用词边界](#10-插件注册校验为什么必须用词边界)
 11. [插件安装开关：单一事实来源的取舍](#11-插件安装开关单一事实来源的取舍)
+12. [trusted-host 白名单：为什么不再改写 Host/Origin](#12-trusted-host-白名单为什么不再改写-hostorigin)
+   - [12.1 白名单匹配为什么是 map + 正则，而不是通配符](#121-白名单匹配为什么是-map--正则而不是通配符)
+   - [12.2 Origin：透传与「不伪造」](#122-origin透传与不伪造)
+   - [12.3 拒绝日志：`error_log` 不吃变量，改用 `access_log if=`](#123-拒绝日志error_log-不吃变量改用-access_log-if)
+   - [12.4 为什么配置要「渲染」而不是直接用](#124-为什么配置要渲染而不是直接用)
+   - [12.5 收集白名单时的 shell 坑（全部实测踩过）](#125-收集白名单时的-shell-坑全部实测踩过)
 
 ---
 
 ## 1. 启动流程总览
 
-容器入口 `script/entrypoint.sh` 以 PID 1 的身份跑六个阶段：
+容器入口 `script/entrypoint.sh` 以 PID 1 的身份跑七个阶段：
 
 | 阶段 | 做什么 | 失败时 |
 |------|--------|--------|
-| `[1/6]` | 未安装则跑 `install-dsh.sh`；随后校验三个插件是否注册 | `exit 1` |
-| `[2/6]` | 证书不存在则生成自签证书 | `exit 1` |
-| `[3/6]` | 启动 Nginx，等 pid 文件与 `/health` 就绪 | `exit 1` |
-| `[4/6]` | 启动 DSH，等就绪行，解析 token | 进程退出则重试（最多 3 轮） |
-| `[5/6]` | 打印访问地址块 | 拿不到 token 则 `exit 1` |
-| `[6/6]` | 起整合 `tail` 转发日志，主流程转入看护循环 | — |
+| `[1/7]` | 未安装则跑 `install-dsh.sh`；随后校验三个插件是否注册 | `exit 1` |
+| `[2/7]` | 渲染 Nginx 配置模板到 `/dsh/run/nginx/`（含 trusted-host 白名单，见 §12） | `exit 1` |
+| `[3/7]` | 证书不存在则生成自签证书 | `exit 1` |
+| `[4/7]` | 启动 Nginx，等 pid 文件与 `/health` 就绪 | `exit 1` |
+| `[5/7]` | 启动 DSH，等就绪行，解析 token | 进程退出则重试（最多 3 轮） |
+| `[6/7]` | 打印访问地址块 | 拿不到 token 则 `exit 1` |
+| `[7/7]` | 起整合 `tail` 转发日志，主流程转入看护循环 | — |
 
 **设计取舍**：整个脚本是「**串行 + 快速失败**」。任何一步不成立就立刻退出，
 让 `--restart` 或编排系统感知并拉起 —— 而不是带着半残状态假装 running。
@@ -103,8 +110,8 @@ dsh web --no-open >> "$DSH_LOG" 2>&1 &
 - 内核保证 append 语义 → 与 DSH 生命周期天然解耦；
 - 跨 `dsh-ctl` 外部重启也成立（每次启动重新打开同一文件追加）。
 
-代价是日志不再自动回显终端 —— 改由 `[4/6]` 阶段的 `tail -F` 转发（带 `[dsh]` 前缀），
-`[6/6]` 之后交给覆盖全量日志目录的整合 `tail` 接管。
+代价是日志不再自动回显终端 —— 改由 `[5/7]` 阶段的 `tail -F` 转发（带 `[dsh]` 前缀），
+`[7/7]` 之后交给覆盖全量日志目录的整合 `tail` 接管。
 **前缀只加在转发流上，不污染文件**，所以解析不受影响。
 
 ---
@@ -284,8 +291,8 @@ for pid in "${victims[@]}"; do kill "$pid" 2>/dev/null || true; done
 `collect_tail_children` 靠 `/proc/<pid>/status` 的 `PPid` 逐层 BFS
 （容器内无 `pkill` / `ps`）。
 
-**要点 4 —— [4/6] 与 [6/6] 共用同一个转发器**。早先两处各写一份，
-[4/6] 只看一个文件、[6/6] 才看全部，于是「启动期看不到日志」。
+**要点 4 —— [5/7] 与 [7/7] 共用同一个转发器**。早先两处各写一份，
+[5/7] 只看一个文件、[7/7] 才看全部，于是「启动期看不到日志」。
 现在两处都调 `start_log_follow`，行为一致。
 
 > 回归测试见用例 15：造一个真实日志目录，断言转发覆盖全部文件、
@@ -408,26 +415,33 @@ glibc 回退到 POSIX/C locale（`LC_CTYPE="POSIX"`）。
 
 ---
 
-## 9. Nginx 路径软链
+## 9. Nginx 路径软链与配置模板
 
 Nginx 二进制由 apt 安装（`/usr/sbin/nginx`），但配置与日志路径都指向 `/dsh`：
 
 ```
-/etc/nginx/nginx.conf → /dsh/config/nginx/nginx.conf
-/etc/nginx/conf.d     → /dsh/config/nginx/conf.d
+/etc/nginx/nginx.conf → /dsh/run/nginx/nginx.conf   （启动时由模板渲染）
+/etc/nginx/conf.d     → /dsh/run/nginx/conf.d       （渲染产物）
 /var/log/nginx        → /dsh/log/nginx
 ```
 
 这样 `/dsh` 依然是「唯一需要挂载/备份的目录」，符合绿色部署的承诺。
 
-**反向代理的两个关键 header**：
+注意 `config/nginx/` 下是**模板**（含 `__XXX__` 占位符），不能被 nginx 直接加载；
+渲染过程见 §12.4。
+
+**反向代理的关键 header（v0.5.0 起）**：
 
 | Header | 值 | 作用 |
 |--------|-----|------|
-| `Host` | `127.0.0.1:3080` | 让 DSH 认为请求来自本地，绕过局域网限制 |
-| `Origin` | `""`（清空） | 使跨站检查失效 |
+| `Host` | `$http_host`（**原样透传**） | DSH 与插件看到的域名 = 来访者用的域名，第三方认证回调地址才正确 |
+| `Origin` | `$dsh_origin`（**有则透传，无则不发**） | 不再清空、也不伪造；跨站检查用的就是真实 Origin |
+| `X-Forwarded-Host` / `X-Forwarded-Port` | 原始 Host / 监听端口 | 让后端能还原真实访问地址 |
 
 同时处理 WebSocket 的 `Upgrade`/`Connection`，并把超时放宽到 3600s（长连接）。
+旧版「Host 改写为 `127.0.0.1:3080` + 清空 Origin」的绕过做法及其问题见 §12。
+
+来访域名由 **trusted-host 白名单**控制，不在白名单的请求直接 403 —— 详见 §12。
 
 ### 9.1 访问日志里的真实客户端 IP
 
@@ -631,3 +645,124 @@ plugins:
 
 另外验证：手动删除 `dsh-ctl` 后重启容器，补装逻辑只补回核心插件，
 **不会**把已关闭的 data-analysis 误装回来。
+
+---
+
+## 12. trusted-host 白名单：为什么不再改写 Host/Origin
+
+### 背景：改写是「绕过」，不是「放行」
+
+v0.4.x 的反代为了绕过 DSH 的局域网限制，把 `Host` 改写成
+`127.0.0.1:3080`、把 `Origin` 清空。DSH 确实起来了，但代价是：
+
+- **插件跳第三方认证直接失败** —— 插件从请求里拿到的域名是 `127.0.0.1:3080`，
+  OAuth/SSO 的回调地址也就指向它，第三方服务不会、也不该往这里回调；
+- DSH 侧**永远看不到真实来访域名**，任何基于域名的功能都失真；
+- 访问控制无从谈起 —— 改写等于宣告「谁来都行」。
+
+v0.5.0 改为：**Host/Origin 原样透传 + 来访域名白名单**。
+白名单解决「以前改写顺便承担的『谁能访问』问题」，且做得更明确。
+
+### 设计目标与 fail-closed
+
+1. `Host` / `Origin` 不改写（插件第三方认证的前提）；
+2. 白名单可从配置文件读，也能 `docker -e` 注入（环境变量优先）；
+3. **fail-closed**：map `default 1`，白名单为空时只有回环可用 ——
+   漏配置的后果是「被拒绝」而不是「被放开」。
+   回环三地址（`127.0.0.1` / `localhost` / `[::1]`）静态内置，保证容器自检可用。
+4. `/health` 不受限，探活不依赖白名单。
+
+配置优先级：`DSH_TRUSTED_HOSTS`（环境变量）> `config/dsh/trusted-hosts.txt` > 空。
+环境变量优先的理由与 §11 同源：`-e` 是临时/编排注入场景，应能覆盖镜像内置文件。
+
+### 12.1 白名单匹配为什么是 map + 正则，而不是通配符
+
+核心载体是 nginx 的 `map $http_host $dsh_host_denied`。这里埋着几个只有
+**起真 nginx 实测**才能发现的坑：
+
+| 坑 | 说明 | 对策 |
+|----|------|------|
+| `map` 通配只支持 `*` 在**开头或结尾**（及 `*.mid.*`） | 文档语义，无法表达「任意端口」 | 见下 |
+| `"host:*"` 是**字面量** | 带星号的规则默认按字符串匹配，`dsh.example.com:*` **永远不会命中** `dsh.example.com:9443` —— 实测用 debug map 验证过 | 端口任配放行改用**锚定正则** |
+| 正则里的 `.` 通配任意字符 | `example.com` 不转义时，`axample.com` 也能匹配 | 生成规则前 `sed` 把 `.` 转成 `\.` |
+| 后缀欺骗 | `example.com.evil.com` 不能因含 `example.com` 被放行 | 精确匹配 + 正则两端锚定（`~^example\.com:`）天然挡掉 |
+
+因此每条纯域名条目生成**两条**规则：
+
+```nginx
+"dsh.example.com"    0;          # 精确匹配（Host 无端口）
+"~^dsh\.example\.com:" 0;        # 任意端口（Host 自带 :port 时）
+```
+
+带端口条目（`dsh.corp.lan:9443`）只生成一条精确匹配 —— Host 头本身带端口时
+就是字面量相等比较，无需正则。IPv6 字面量 `[::1]` 同理（含静态内置的
+`~^\[::1\]:` 正则）。
+
+### 12.2 Origin：透传与「不伪造」
+
+```nginx
+map $http_origin $dsh_origin {
+    default $http_origin;   # 有就透传
+    ""      "";             # 没有就输出空
+}
+...
+proxy_set_header Origin $dsh_origin;
+```
+
+nginx 的语义是 `proxy_set_header X "";` = **删除该头**（不是发送空值）。
+这恰好是想要的：浏览器带 Origin 就原样转交，不带（同源 GET、curl）就不伪造一个。
+旧版无条件清空 Origin 与「透传」都做不到 —— 插件的跨站校验两端都拿不到真实值。
+
+### 12.3 拒绝日志：`error_log` 不吃变量，改用 `access_log if=`
+
+需求是「拒绝日志可开关」。最直觉的 `error_log /path $var;` 是**语法错误**
+（`invalid log level "$var"`，nginx 直接拒绝启动）—— `error_log` 只接受字面量级别。
+
+改用 `access_log` 的条件日志：
+
+```nginx
+log_format dsh_denied 'host=$http_host status=$status remote=$remote_addr xff="$http_x_forwarded_for"';
+access_log /dsh/log/nginx/denied.log dsh_denied if=$dsh_deny_log;
+```
+
+两个细节：
+
+- `if=` 只把 **`"0"` 和空串**当 false，其他一切（包括 `"debug"`、`"off"` 字符串本身）
+  都会记日志 —— 所以开关值先由 `map` 归一化为 `"0"`/`"1"`；
+- 渲染时 `__DSH_DENY_LOG__` 替换为 `1`/`0`（`DSH_TRUSTED_HOST_DENY_LOG=off/0/false/no`
+  即关），`map` 里 `"0" "0"` 兜底保证「放行的请求永不进 denied.log」。
+
+拒绝日志同样被 `[7/7]` 的日志转发纳进 `docker logs`，不用进容器就能看到谁被拒了。
+
+### 12.4 为什么配置要「渲染」而不是直接用
+
+占位符（`__DSH_WEB_HOST__`、`__TRUSTED_HOST_MAP__` 等）来自运行时才确定的值
+（环境变量、白名单列表），所以 `config/nginx/` 只能是**模板**：
+
+- 启动时（`[2/7]`）渲染到 `/dsh/run/nginx/`，`/etc/nginx` 的软链指向**渲染产物**；
+- 模板目录绝不能被 nginx 直接加载 —— 占位符会被当字面量，行为不可预期；
+  主配置 `include` 路径也同步改指渲染目录，并在注释里说明原因；
+- Dockerfile 构建期做**双向占位符自检**：模板里的每个 `__XXX__` 都必须被
+  `entrypoint.sh` 认识，反之亦然 —— 改模板忘改脚本（或相反）直接构建失败，
+  不至于带病发布。
+
+### 12.5 收集白名单时的 shell 坑（全部实测踩过）
+
+白名单解析在 `entrypoint.sh` 的 8 个函数里，四个坑都是回归测试
+（`test/test_trusted_host.sh` 用例 2/3/4/5b）钉死的：
+
+| # | 坑 | 现象 | 修复 |
+|---|-----|------|------|
+| 1 | `while read < <(producer)` **丢最后一行** | `while ... done < <(collect_trusted_host_raw)`：producer 输出没有尾随换行时（`printf '%s' "a,b"`、用户编辑器不补换行），最后一行被静默丢弃 —— **上游既存模式同款问题** | 两个数据源分支都显式补 `printf '\n'` |
+| 2 | 去重基线缺前导 `\n` | `seen=""` 起步时，第一条 `a.com\n` 不满足 `*$'\n'"a.com"$'\n'*`，`a.com,A.COM,a.com` 去重失败 | `seen=$'\n'` 起步 |
+| 3 | 默认 `IFS` 含 `:` | `for host in $line` 把 `dsh.corp.com:9443` 拆成 `dsh.corp.com` + `9443` | 分词前 `local IFS=$' \t,;'` |
+| 4 | 带端口条目被当纯域名转义 | `sed 's/\./\\./g'` 生成的 `"example\.org:9443"` 精确规则永远匹配不上 | 带端口条目原样输出（见 §12.1） |
+
+> 回归测试 `test/test_trusted_host.sh` 覆盖 74 条断言，其中用例 11 起**真 nginx**
+> + 回显后端做端到端验证：白名单域名（含/不含端口）放行、端口限定外拒绝、
+> 后缀欺骗拒绝、`axample.com` 拒绝（验证 `.` 转义）、Host/Origin 透传、
+> 无 Origin 时头被删除、`/health` 不受限。
+
+---
+
+[v0.5.0]: https://github.com/higkoo/dsh-docker/releases/tag/v0.5.0

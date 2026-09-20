@@ -29,6 +29,22 @@
     # 版本配置文件路径（容器内）
     versions_file: "/dsh/config/dsh/versions.yml"
 
+    # ------------------------------------------------------------
+    # 可信来访域名白名单（trusted-host）
+    #
+    # Nginx 不再改写 Host / Origin（那样会让插件跳第三方认证时拼错
+    # 回调地址），因此必须显式声明合法的来访域名，否则除回环地址外
+    # 一律 403。详见 README「可信来访域名」与 docs/DESIGN.md。
+    #
+    # 用法：在 inventory 里按主机设定，或在命令行覆盖，例如
+    #   ansible-playbook -i inventory.ini playbook.yml \
+    #     -e 'dsh_trusted_hosts=["dsh.corp.com","10.0.0.8"]'
+    #
+    # 留空（默认）则容器内退化为「只允许回环地址访问」，
+    # 部署完记得补上，否则浏览器访问会得到 403。
+    # ------------------------------------------------------------
+    dsh_trusted_hosts: []
+
   tasks:
     # ------------------------------------------------------------
     # 1. 读取版本配置文件
@@ -50,6 +66,14 @@
           - "DSH Version: {{ dsh_version }}"
           - "DSH URL: {{ dsh_url | default('(not set)') }}"
           - "Plugins: {{ dsh_plugins | map(attribute='name') | list }}"
+          - "Trusted hosts: {{ dsh_trusted_hosts | default([]) }}"
+
+    - name: Warn when trusted-host whitelist is empty
+      ansible.builtin.debug:
+        msg:
+          - "警告：dsh_trusted_hosts 为空 —— 容器将只允许回环地址访问，"
+          - "      浏览器访问会得到 403。请用 -e 'dsh_trusted_hosts=[...]' 指定域名或 IP。"
+      when: dsh_trusted_hosts | length == 0
 
     # ------------------------------------------------------------
     # 2. 构建 Docker 镜像
@@ -90,6 +114,9 @@
           - "{{ project_dir }}/config/dsh/versions.yml:/dsh/config/dsh/versions.yml:ro"
         env:
           DSH_HOME: "/dsh/home"
+          # 可信来访域名白名单（逗号分隔）。为空则不注入，
+          # 让容器内退化为「只允许回环地址」的 fail-closed 行为。
+          DSH_TRUSTED_HOSTS: "{{ dsh_trusted_hosts | join(',') }}"
         log_driver: json-file
         log_options:
           max-size: "10m"
