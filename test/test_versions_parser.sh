@@ -602,7 +602,9 @@ write_yml() { printf '%s\n' "$1" > "$PROBE_ROOT/config/dsh/versions.yml"; }
 check_enabled() {  # $1=插件名  $2=yml内容
     write_yml "$2"
     (
-        DSH_ROOT="$PROBE_ROOT"
+        # export 而非普通赋值：函数体经 eval 展开后引用该变量，
+        # export 写法可让 shellcheck 明确其用途（SC2034）
+        export DSH_ROOT="$PROBE_ROOT"
         eval "$(sed -n '/^plugin_enabled_in_versions()/,/^}/p' "$SCRIPT_DIR/entrypoint.sh")"
         plugin_enabled_in_versions "$1"
     )

@@ -14,7 +14,7 @@ FROM debian:trixie-slim
 #    两处需保持文案一致，CI 与 Dockerfile 共用同一个描述常量。
 # ============================================================
 LABEL org.opencontainers.image.source="https://github.com/higkoo/dsh-docker"
-LABEL org.opencontainers.image.description="DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理、自签 HTTPS、进程看护与健康检查。"
+LABEL org.opencontainers.image.description="DeepSeek Harness (DSH) 的容器化绿色部署方案 —— 拉起即可使用 DSH Web 服务，内置 Nginx 反向代理（trusted-host 域名白名单、Host/Origin 原样透传）、自签 HTTPS、进程看护与健康检查。"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # 镜像版本号：由 CI 在构建时通过 --build-arg DSH_IMAGE_VERSION=<tag> 传入，
@@ -124,6 +124,10 @@ ARG PYTHON_MODE=apt
 # ============================================================
 # 3. 创建 /dsh 绿色安装目录结构
 #    python 相关目录仅在需要时创建（none 模式不留空目录）
+#
+#    /dsh/run/nginx/conf.d 是 **Nginx 配置渲染产物**的落点：
+#    /dsh/config 下的是含占位符的模板，容器启动时由 entrypoint.sh 渲染到这里。
+#    预先建好可以让渲染逻辑只管写文件，不必再判目录。
 # ============================================================
 RUN mkdir -p \
         /dsh/app/nodejs \
@@ -134,7 +138,7 @@ RUN mkdir -p \
         /dsh/log/nginx \
         /dsh/log/dsh \
         /dsh/log/plugins \
-        /dsh/run \
+        /dsh/run/nginx/conf.d \
         /dsh/workspace \
         /dsh/home \
         /dsh/script \
@@ -318,6 +322,7 @@ COPY profile.env                       /dsh/profile.env
 COPY config/nginx/nginx.conf          /dsh/config/nginx/nginx.conf
 COPY config/nginx/conf.d/dsh-proxy.conf /dsh/config/nginx/conf.d/dsh-proxy.conf
 COPY config/dsh/versions.yml          /dsh/config/dsh/versions.yml
+COPY config/dsh/trusted-hosts.txt     /dsh/config/dsh/trusted-hosts.txt
 COPY ansible/playbook.yml             /dsh/config/ansible/playbook.yml
 COPY script/entrypoint.sh             /dsh/script/entrypoint.sh
 COPY script/install-dsh.sh            /dsh/script/install-dsh.sh
@@ -326,6 +331,16 @@ RUN chmod +x /dsh/script/entrypoint.sh /dsh/script/install-dsh.sh
 # ============================================================
 # 10. Nginx 配置：使用 /dsh 目录下的配置
 #     用软链接替换系统默认路径，确保兼容性
+#
+#     ⚠ /etc/nginx/conf.d → /dsh/config/nginx/conf.d 这个软链**必须保留**，
+#       它是给「进容器手动排查配置」的人看的（能直接看到原始模板）。
+#       但注意 /dsh/config/nginx/conf.d 里放的是**含占位符的模板**，
+#       它**不能**被 nginx 直接加载 —— 否则会因 `__TRUSTED_HOST_MAP__`
+#       之类的未知指令而启动失败。
+#       所以真正被加载的是渲染产物 /dsh/run/nginx/conf.d/*.conf，
+#       这一条由 /dsh/config/nginx/nginx.conf 里的 include 显式指定；
+#       而 Debian 自带的 /etc/nginx/nginx.conf（会 include
+#       /etc/nginx/conf.d/*.conf）已被替换掉，不会参与加载。
 # ============================================================
 RUN rm -rf /etc/nginx/conf.d \
     && ln -s /dsh/config/nginx/conf.d /etc/nginx/conf.d \
@@ -378,6 +393,41 @@ ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && echo "${TZ}" > /etc/timezone \
     && date
+# 13. Nginx 配置模板自检（构建期）
+#     把「模板与 entrypoint.sh 不同步」这类错误**挡在构建阶段**，
+#     而不是等用户起容器时才发现服务起不来。
+#
+#     检查两件事（不依赖 nginx 二进制，故在构建的任何阶段都能跑）：
+#       1. 模板里出现的每个占位符，entrypoint.sh 的 render_nginx_conf
+#          都必须认识（否则渲染后会残留 __XXX__，nginx 直接启动失败）；
+#       2. entrypoint.sh 里替换的每个占位符，模板里都必须真的存在
+#          （否则说明模板改名了、脚本没跟上，替换静默失效）。
+#
+#     真正的语义验证（渲染后 `nginx -t` + 白名单放行/拒绝行为）
+#     在 test/test_trusted_host.sh 里做，那里有完整环境。
+RUN set -eu; \
+    template_phs="$(grep -ohE '__[A-Z_]+__' \
+        /dsh/config/nginx/nginx.conf \
+        /dsh/config/nginx/conf.d/dsh-proxy.conf \
+        | sort -u)"; \
+    script_phs="$(grep -ohE 's\|__[A-Z_]+__\||s\|__[A-Z_]+__\|' /dsh/script/entrypoint.sh \
+        | grep -oE '__[A-Z_]+__' | sort -u; \
+        grep -oE '__TRUSTED_HOST_MAP__' /dsh/script/entrypoint.sh | sort -u)"; \
+    echo "模板占位符: $(echo "$template_phs" | tr '\n' ' ')"; \
+    for ph in $template_phs; do \
+        if ! grep -qF -- "$ph" /dsh/script/entrypoint.sh; then \
+            echo "错误：模板里的占位符 $ph 在 entrypoint.sh 中无对应替换逻辑" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    for ph in $script_phs; do \
+        if ! grep -qF -- "$ph" /dsh/config/nginx/nginx.conf \
+           && ! grep -qF -- "$ph" /dsh/config/nginx/conf.d/dsh-proxy.conf; then \
+            echo "错误：entrypoint.sh 替换的占位符 $ph 在模板中不存在" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    echo "Nginx 配置模板占位符自检通过"
 
 # 端口说明：外部 9080->80(HTTP)，外部 9443->443(HTTPS/SSL)
 EXPOSE 80 443

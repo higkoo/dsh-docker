@@ -19,6 +19,7 @@ docker pull ghcr.io/higkoo/dsh:latest && docker run -d -p 9080:80 -p 9443:443 --
 
 ```bash
 docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
+  -e DSH_TRUSTED_HOSTS="dsh.example.com" \
   -p 9080:80 -p 9443:443 \
   ghcr.io/higkoo/dsh:latest
 ```
@@ -29,7 +30,7 @@ docker run -d --name dsh-web --hostname dsh-web --restart unless-stopped \
 
 ```
 ============================================================
-  [5/6] DSH 已就绪，请访问:
+  [6/7] DSH 已就绪，请访问:
     HTTP : http://<你的IP>:9080/?token=xxxxxxxx
     HTTPS: https://<你的IP>:9443/?token=xxxxxxxx
   容器内直连: http://127.0.0.1:3080/?token=xxxxxxxx
@@ -73,6 +74,35 @@ ansible-playbook -i inventory.ini playbook.yml   # 默认映射 9080:80 / 9443:4
 | Web UI (HTTPS) | `https://<IP>:9443/?token=<token>` | 自签证书，需信任一次 |
 | 健康检查 | `http://<IP>:9080/health` | Nginx 状态页，无需 token |
 
+### 来访域名白名单（trusted-host）——必读
+
+Nginx **不再改写** `Host` / `Origin`（改写会导致插件跳第三方认证失败），
+改用白名单校验来访者：**域名不在白名单里直接 403**。白名单两种配法
+（环境变量优先，改完重启容器生效）：
+
+```bash
+# 方式一：docker run -e 注入（逗号/分号分隔）
+docker run -d --name dsh-web \
+  -e DSH_TRUSTED_HOSTS="dsh.example.com, dsh.corp.lan:9443, 10.8.0.9" \
+  -p 9080:80 -p 9443:443 \
+  ghcr.io/higkoo/dsh:latest
+
+# 方式二：挂载/编辑 config/dsh/trusted-hosts.txt（每行一个域名，支持 # 注释）
+```
+
+| 规则 | 示例 | 效果 |
+|------|------|------|
+| 纯域名 | `dsh.example.com` | 任意端口放行 |
+| 带端口 | `dsh.corp.lan:9443` | 仅该端口放行 |
+| 子域名 | — | **不**自动放行（防后缀欺骗） |
+| IPv6 | `[::1]` | 字面量形式书写 |
+| 白名单为空 | — | **仅回环地址可访问**（fail-closed） |
+
+> **升级到 v0.5.0 必读**：默认白名单只有回环地址，升级后除本机外的访问都会 403，
+> **必须显式配置来访域名**。被拒请求记录在 `/dsh/log/nginx/denied.log`，
+> 可用 `-e DSH_TRUSTED_HOST_DENY_LOG=off` 关闭该日志。
+> 设计原理见 [docs/DESIGN.md](docs/DESIGN.md#12-trusted-host-白名单为什么不再改写-hostorigin)。
+
 ### token 丢了怎么办
 
 token 每次启动都是新生成的，**取最后一条就是当前有效的**：
@@ -110,6 +140,8 @@ docker logs dsh-web 2>&1 | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1
 | `DSH_HOME` | `/dsh/home` | DSH 数据目录（profile、插件数据） |
 | `DSH_WEB_PORT` | `3080` | DSH Web UI 监听端口（改完要同步改 Nginx 配置） |
 | `DSH_HTTP_PORT` / `DSH_HTTPS_PORT` | `9080` / `9443` | **仅影响启动提示的显示**，真实端口以 `-p` 为准 |
+| `DSH_TRUSTED_HOSTS` | 空 | **来访域名白名单**（逗号/分号分隔）；为空则仅回环可访问，见上文专节 |
+| `DSH_TRUSTED_HOST_DENY_LOG` | `debug` | 白名单拒绝日志开关，`off`/`0`/`false` 关闭 `denied.log` |
 | `DSH_ENABLE_DATA_ANALYSIS` | 未设置 | 数据分析插件开关，`true` 则安装；不设置时以 `versions.yml` 的 `enabled` 为准（默认关） |
 | `DSH_READY_TIMEOUT` / `DSH_READY_HARD_TIMEOUT` / `DSH_DOWN_GRACE` | `120` / `0` / `90` | 就绪等待与故障容忍窗口，一般不用动 |
 
@@ -230,6 +262,7 @@ docker exec dsh-web tail -50 /dsh/log/dsh/dsh-web.log
 [18:12:17] 10.88.7.123 - - [16/Sep/2026:18:12:17 +0800] "GET / HTTP/1.1" 401 79 "-" "Mozilla/5.0 ..." hop=172.17.0.1 xff="10.88.7.123, 10.0.2.100"
 ```
 
+
 | 字段 | 含义 |
 |------|------|
 | 第 1 列 | 客户端 IP（有 XFF 时是**真实客户端**，否则是最后一跳） |
@@ -284,12 +317,15 @@ docker run -d --name dsh-web --network host \
 > 用 host 或 pasta 时，若仍想保留网关 IP 用于排查，可把
 > `set_real_ip_from` 收敛为实际代理网段（公网部署建议这么做，防 XFF 伪造）。
 
+被白名单拒绝的请求单独记录在 `/dsh/log/nginx/denied.log`（同样转发到 `docker logs`），
+一行一条：`host=来访域名 status=403 remote=直连IP xff="完整XFF链"`。
+
 日志按来源分目录存放，找问题直接去对应目录：
 
 | 目录 | 内容 |
 |------|------|
 | `/dsh/log/dsh/` | DSH 本体运行日志、安装日志 |
-| `/dsh/log/nginx/` | 访问日志、错误日志 |
+| `/dsh/log/nginx/` | 访问日志、错误日志、白名单拒绝日志（denied.log） |
 | `/dsh/log/plugins/` | 各插件自己的日志（含 `dshctl` 重启的接力日志） |
 
 ### 常见现象对照
@@ -298,6 +334,8 @@ docker run -d --name dsh-web --network host \
 |------|-----------|--------|
 | 一直「DSH 启动中...」 | 数据分析插件在建 venv、装依赖，正常 | 等 5~10 分钟，心跳还在就别动它 |
 | 日志停在「dsh web 启动 #1」不动 | DSH 正在装插件的重依赖，中间不写日志属正常 | 看 `[18:12:17] ==> install.log <==` 段是否在刷 |
+| 访问返回 **403 Forbidden: host ... not in trusted hosts** | 来访域名不在白名单（v0.5.0 起默认仅回环） | 把域名加进 `DSH_TRUSTED_HOSTS` 或 `config/dsh/trusted-hosts.txt`，重启容器 |
+| 插件跳第三方认证失败 | 仍在用 ≤ v0.4.4 的旧镜像（旧版改写 Host/Origin） | 升级到 v0.5.0+，并配好白名单 |
 | 容器 `exit 1`，日志提到 **pnpm failed / `registry.npmjs.org`** | pnpm 自举下二进制时**不读 npmrc**，硬走 `registry.npmjs.org` | 加 `-e COREPACK_NPM_REGISTRY=https://registry.npmmirror.com/`（见下） |
 | 容器 `exit 1`，日志提到 **`pypi.org` / marivo 装不上** | 数据分析插件用 pip 装 Python 包，直连 PyPI | 加 `-e PIP_INDEX_URL=...`（见下） |
 | 日志里一堆 Node 崩溃栈，提到 `plugin tree failed to load` | 某个插件加载失败（如 `none` 模式下缺 Python） | 用默认 `apt` 模式重构建 |
@@ -343,8 +381,8 @@ docker run -d --name dsh-web \
 | 标签 | 含义 | 场景 |
 |------|------|------|
 | `latest` | 最新稳定版 | 日常使用 |
-| `v0.4.4` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
-| `v0.4` | 次版本浮动，随补丁更新 | 跟随次版本线 |
+| `v0.5.0` | 固定版本，永不改变 | **生产推荐**，避免意外升级 |
+| `v0.5` | 次版本浮动，随补丁更新 | 跟随次版本线 |
 | `sha-<短提交>` | 对应具体提交 | 精确回溯 |
 
 推送 `vX.Y.Z` 标签后 CI 自动构建并产出上述标签；普通分支推送只更新 `latest` 与 `sha-*`。
@@ -357,8 +395,9 @@ docker run -d --name dsh-web \
 ```
 /dsh/
 ├── app/          # 绿色安装的 Node.js / Python
-├── config/       # nginx、dsh(versions.yml)、ansible 配置
+├── config/       # nginx 模板、dsh(versions.yml、trusted-hosts.txt) 配置
 ├── log/          # 日志（dsh / nginx / plugins 分类）
+├── run/          # nginx.pid、dsh.pid、渲染后的 Nginx 运行配置
 ├── home/         # DSH 数据目录
 ├── workspace/    # DSH 工作区
 ├── script/       # entrypoint.sh、install-dsh.sh
@@ -383,29 +422,31 @@ docker run -d --name dsh-web \
 │
 ├── config/
 │   ├── nginx/
-│   │   ├── nginx.conf           # 主配置
-│   │   ├── conf.d/dsh-proxy.conf# DSH 反代 + 健康检查
+│   │   ├── nginx.conf           # 主配置（模板，启动时渲染到 /dsh/run）
+│   │   ├── conf.d/dsh-proxy.conf# 反代模板：trusted-host 白名单 + Host/Origin 透传 + 健康检查
 │   │   └── ssl/                 # 自签证书（首次启动生成）
 │   ├── dsh/versions.yml         # DSH 及插件版本配置
+│   ├── dsh/trusted-hosts.txt    # 来访域名白名单（可用 DSH_TRUSTED_HOSTS 覆盖）
 │   └── ansible/                 # playbook.yml、inventory.ini
 │
 ├── log/
-│   ├── nginx/                   # access.log、error.log
+│   ├── nginx/                   # access.log、error.log、denied.log（白名单拒绝）
 │   ├── dsh/                     # dsh-web.log、install.log
 │   └── plugins/                 # 各插件日志（包名 '/' 安全化为 '__'）
 │
-├── run/                         # nginx.pid、dsh.pid
+├── run/                         # nginx.pid、dsh.pid、渲染后的 Nginx 配置（conf.d）
 ├── workspace/                   # DSH 工作区
 ├── home/profiles/               # 插件 profile 目录
 └── script/
-    ├── entrypoint.sh            # 容器启动入口
+    ├── entrypoint.sh            # 容器启动入口（7 阶段）
     └── install-dsh.sh           # DSH 及插件安装脚本
 ```
 
 > Nginx 二进制由 apt 安装（`/usr/sbin/nginx`），但配置与日志已通过软链接指向 `/dsh/`：
-> `/etc/nginx/nginx.conf` → `/dsh/config/nginx/nginx.conf`，
-> `/etc/nginx/conf.d` → `/dsh/config/nginx/conf.d`，
+> `/etc/nginx/nginx.conf` → `/dsh/run/nginx/nginx.conf`（启动时从模板渲染），
+> `/etc/nginx/conf.d` → `/dsh/run/nginx/conf.d`（渲染产物），
 > `/var/log/nginx` → `/dsh/log/nginx`。
+> `config/nginx/` 下的是**模板**，直接改动需重启容器生效。
 
 </details>
 
@@ -415,19 +456,22 @@ docker run -d --name dsh-web \
 
 README 只讲「怎么用」。**为什么这么设计、踩过哪些坑**，都在
 [docs/DESIGN.md](docs/DESIGN.md)：就绪判定为何用事件而非时长、看护为何看 HTTP 而非 PID、
-token 的生命周期、Python 与插件的依赖关系、apt/source 两种模式的目录对齐等。
+token 的生命周期、Python 与插件的依赖关系、apt/source 两种模式的目录对齐、
+为什么不再改写 Host/Origin 而改用 trusted-host 白名单等。
 
 ## 开发
 
 ```bash
 bash test/test_versions_parser.sh    # versions.yml 解析器边界测试（CI 同步执行）
+bash test/test_trusted_host.sh       # trusted-host 白名单与透传语义测试（含真 nginx 验证）
+shellcheck -S warning script/*.sh test/*.sh   # 静态检查（CI 同步执行）
 ```
 
 发布新版本：
 
 ```bash
-git tag -a v0.4.4 -m "v0.4.4: 变更说明"
-git push origin v0.4.4               # CI 自动 lint → 构建 → 推送镜像
+git tag -a v0.5.0 -m "v0.5.0: 变更说明"
+git push origin v0.5.0               # CI 自动 lint → 构建 → 推送镜像
 ```
 
 ## 许可证（License）

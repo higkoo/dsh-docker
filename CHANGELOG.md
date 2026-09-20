@@ -2,6 +2,97 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 `v0.4.0` 起进入稳定维护阶段，只做向后兼容的修复与打磨。
+`v0.5.0` 引入一项有行为变化的改进（trusted-host 白名单），故升位次版本号。
+
+---
+
+## [v0.5.0] — 2026-09-20 · Host/Origin 原样透传 + trusted-host 来访域名白名单
+
+### 背景
+
+此前 Nginx 反向代理会把 `Host` 改写成 `127.0.0.1:3080`、把 `Origin` 清空，
+以此绕过 DSH 的局域网限制。但这会**破坏依赖真实 Host/Origin 的插件**：
+跳转第三方认证（OAuth / SSO 回调）时，插件告诉第三方的回调地址是
+`127.0.0.1:3080`，认证流程直接失败。
+
+v0.5.0 改为「**原样透传 + 来访域名白名单**」：Nginx 不再改写 Host/Origin，
+改用一张 trusted-host 白名单决定放行谁；不在白名单里的来访域名直接 403。
+
+### 行为变化（升级必读）
+
+| 项 | v0.4.x | v0.5.0 起 |
+|----|--------|----------|
+| `Host` 传给 DSH | 改写为 `127.0.0.1:3080` | **原样透传**（来访者用的域名） |
+| `Origin` 传给 DSH | 清空 | **原样透传**（无 Origin 时不伪造） |
+| 来访域名控制 | 无 | trusted-host 白名单，**默认仅回环** |
+| 未列入白名单的访问 | 任何人可访问 | **403 拒绝** |
+
+**升级注意**：默认白名单只含回环地址（`127.0.0.1` / `localhost` / `[::1]`），
+升级后**除本机外的访问都会 403**，必须显式配置来访域名后重启容器。
+
+### 白名单配置（两种方式，环境变量优先）
+
+方式一：`docker run -e` 注入（逗号 / 分号分隔均可）：
+
+```bash
+docker run -d --name dsh-web \
+  -e DSH_TRUSTED_HOSTS="dsh.example.com, dsh.corp.lan:9443, 10.8.0.9" \
+  -p 9080:80 -p 9443:443 \
+  ghcr.io/higkoo/dsh:latest
+```
+
+方式二：编辑 `config/dsh/trusted-hosts.txt`（每行一个域名，`#` 注释，
+逗号/分号/空格分隔的多写法也支持）后重启容器。
+
+规则要点：
+
+- 写纯域名 = 该域名**任意端口**都放行；
+- 写 `host:port` = 仅该端口放行；
+- 子域名**不**自动放行（`example.com` 不会放行 `evil.example.com`，
+  也不会放行 `example.com.evil.com` 这类后缀欺骗）；
+- IPv6 字面量用 `[::1]` 形式书写；
+- 白名单为空时**仅回环地址可访问**（fail-closed：漏配置只会拒绝，不会放开）。
+
+### Nginx 配置模板化
+
+Nginx 配置改为**模板**，容器启动时渲染到 `/dsh/run/nginx/conf.d/` 再加载：
+
+- `config/nginx/` 下是模板（含 `__XXX__` 占位符），**不再被 nginx 直接加载**；
+- `/etc/nginx/conf.d` 软链改指渲染产物目录；
+- 想改代理规则请改模板后重启容器；镜像构建时会做
+  「模板占位符 ↔ 渲染脚本」双向自检，占位符失配直接构建失败。
+
+### 拒绝日志
+
+被白名单拒绝的请求记录到 `/dsh/log/nginx/denied.log`
+（host、status、来源 IP、XFF），并同步转发到 `docker logs`。
+`-e DSH_TRUSTED_HOST_DENY_LOG=off` 可关闭。
+> 实现说明：nginx 的 `error_log` 不接受变量日志级别，
+> 故用 `access_log ... if=$变量` 实现开关（`map` 派生 `"0"`/`"1"`）。
+
+### 附带修复
+
+- 修复 `profile.env` 中两条 `export` 意外拼接、导致 `NGINX_LOG_DIR`
+  从未真正导出的既存问题。
+
+### 改动文件
+
+```
+ script/entrypoint.sh                | 启动流程 6 阶段 → 7 阶段（新增 [2/7] 渲染 Nginx 配置）+ 8 个白名单函数
+ config/nginx/nginx.conf             | include 改指渲染目录 /dsh/run/nginx/conf.d
+ config/nginx/conf.d/dsh-proxy.conf  | Host/Origin 透传 + trusted-host map + 403 + denied.log
+ config/dsh/trusted-hosts.txt        | 新增：白名单配置文件（含格式说明）
+ profile.env                         | 登记 DSH_TRUSTED_HOSTS / DSH_TRUSTED_HOST_DENY_LOG
+ Dockerfile                          | COPY 白名单文件 + 构建期模板占位符双向自检
+ ansible/playbook.yml                | 新增 dsh_trusted_hosts 变量并注入容器环境
+ test/test_trusted_host.sh           | 新增：74 条断言（含起真 nginx 验证白名单/透传语义）
+ .github/workflows/docker-build.yml  | lint 覆盖新测试与 profile.env，新增测试步骤
+ README.md / docs/DESIGN.md          | 新章节与原理说明
+```
+
+测试：`test_trusted_host.sh` 74 条断言全绿（含真实 nginx 语义验证：白名单放行、
+端口限定、后缀欺骗拒绝、Host/Origin 透传、空 Origin 不伪造）；
+`test_versions_parser.sh` 100 条断言全绿；`shellcheck -S warning`、`bash -n` 通过。
 
 ---
 
@@ -336,6 +427,8 @@
 
 ---
 
+[v0.5.0]: https://github.com/higkoo/dsh-docker/releases/tag/v0.5.0
+[v0.4.4]: https://github.com/higkoo/dsh-docker/releases/tag/v0.4.4
 [v0.4.1]: https://github.com/higkoo/dsh-docker/releases/tag/v0.4.1
 [v0.4.0]: https://github.com/higkoo/dsh-docker/releases/tag/v0.4.0
 [v0.3.9]: https://github.com/higkoo/dsh-docker/releases/tag/v0.3.9
